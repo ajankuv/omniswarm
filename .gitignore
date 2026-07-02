@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state (persists on the /data volume — never in the repo or image)
+omniswarm.db
+omniswarm.db-*
+omniswarm.runtime.json
+
+# Local config / secrets (ship the .example, not the real one)
+.env
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Build & planning artifacts — internal, not shipped to customers
+.superpowers/
+docs/superpowers/
+roadmap.md

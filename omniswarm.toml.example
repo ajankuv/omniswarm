@@ -1,0 +1,91 @@
+# OmniSwarm configuration — copy to `omniswarm.toml` (or point OMNISWARM_CONFIG at it).
+# Everything is OPTIONAL; anything you omit uses the built-in defaults.
+#
+# The gateway URL is set via the OMNISWARM_OMNIROUTE_URL environment variable
+# (point it at YOUR OpenAI-compatible gateway). This file maps task types and the
+# council to whatever model NAMES your gateway exposes.
+#
+# The values below are the built-in defaults, chosen from a 2026-06 benchmark of the
+# OmniRoute pool. At benchmark time only NVIDIA + Mistral were serving, so hot paths
+# are load-balanced 3/3 across those two live providers. Swap in your own gateway's
+# model names / providers as availability changes.
+#
+# NOTE: you don't have to edit this file to change models. The Control Panel's
+# "Model Picker" lets you choose the model for each task type / judge / council role
+# live (with recommendations) and applies it at runtime with no rebuild. Those runtime
+# picks persist and OVERRIDE the defaults here. This file is the fallback/base config.
+
+[models]
+# task type -> the model your gateway should use for it
+# NVIDIA maverick: 8/8 classify@0.37s, 8/8 general@0.53s, 9.83/10 summarize@0.96s
+general   = "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+summarize = "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+classify  = "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+# Mistral (spreads load off NVIDIA)
+draft     = "mistral/mistral-medium-3-5"
+reasoning = "mistral/mistral-medium-3-5"       # 8/8 reasoning@1.59s
+code      = "mistral/devstral-latest"          # code specialist, 7/8@2.06s
+# You can add your own task types here too, e.g.:
+# translate = "some/translation-model"
+
+[judge]
+# the model that scores each draft against the task rubric (Tier 1).
+# Must stay reliable under load — nvidia/mistral-large-3 was dropped because it collapses.
+model = "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+
+[council]
+# the model that synthesizes the council's review (Tier 2) — kept on a DIFFERENT
+# provider (Mistral) from the judge (NVIDIA) so a single provider outage can't take both.
+synth_model = "mistral/mistral-medium-3-5"
+# the cross-provider models that form the council (use DIFFERENT providers/lineages —
+# diversity is the point; same-provider models share blind spots). Only NVIDIA + Mistral
+# were live at benchmark time; re-add Groq/Gemini/SambaNova here when they recover.
+generators = [
+    "nvidia/meta/llama-4-maverick-17b-128e-instruct",
+    "mistral/mistral-medium-3-5",
+    "nvidia/minimaxai/minimax-m3",
+]
+
+# --- Role-based council (Tier 2 review board) ---
+# Each member reviews the draft from its persona; the chair (synth_model) integrates
+# their critiques. Define your own roles; use cross-provider models for diversity.
+# The active subset is ticked live in the Control Panel (Council Roster section).
+[[council.members]]
+role = "Security Engineer"
+model = "mistral/devstral-latest"
+focus = "known CVEs in named dependencies/versions, injection (SQL/command/path), secret or credential leakage, SSRF, unsafe deserialization, and other exploitable or harmful code"
+
+[[council.members]]
+role = "Code Auditor"
+model = "mistral/codestral-latest"
+focus = "code correctness, edge cases, efficiency, and whether the logic actually works"
+
+[[council.members]]
+role = "Clarity Editor"
+model = "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+focus = "readability, coherence, structure, and logical flow of the explanation"
+
+[[council.members]]
+role = "Fact-Checker"
+model = "mistral/mistral-medium-3-5"
+focus = "factual accuracy — cross-check claims against well-known facts and flag unsupported ones"
+
+[[council.members]]
+role = "Safety Sentinel"
+model = "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+focus = "harmful, biased, unsafe, or ethically questionable content, including edge cases"
+
+[[council.members]]
+role = "Data Guardian"
+model = "nvidia/minimaxai/minimax-m3"
+focus = "statistical claims, numerical accuracy, data interpretation, and privacy/data-leak risks"
+
+[[council.members]]
+role = "User Advocate"
+model = "mistral/mistral-medium-3-5"
+focus = "whether the answer meets the user's intent, is practical and actionable, and avoids misuse"
+
+# Optional: which members review which task types (default = all members)
+[council.roster_overrides]
+code = ["Security Engineer", "Code Auditor", "User Advocate"]
+reasoning = ["Fact-Checker", "Data Guardian", "Clarity Editor"]

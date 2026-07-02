@@ -1,0 +1,24 @@
+# OmniSwarm — one-command run. `docker compose up -d` then open http://localhost:8100
+services:
+  omniswarm:
+    build: .
+    image: omniswarm:latest
+    container_name: omniswarm
+    ports:
+      - "8100:8100"
+    environment:
+      # Point at YOUR OpenAI-compatible gateway (OmniRoute by default).
+      - OMNISWARM_OMNIROUTE_URL=http://localhost:20128/v1
+      # Optional: protect the instance + tune (also editable live in the Control Panel)
+      # - OMNISWARM_API_TOKEN=
+      # Optional: bring your own model map / council roster
+      # - OMNISWARM_CONFIG=/config/omniswarm.toml
+    volumes:
+      # Jobs + runtime settings persist here across restarts.
+      - omniswarm-data:/data
+      # Optional: mount your own config (read-only)
+      # - ./omniswarm.toml:/config/omniswarm.toml:ro
+    restart: unless-stopped
+
+volumes:
+  omniswarm-data:

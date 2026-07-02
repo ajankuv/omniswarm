@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OmniSwarm · Dashboard</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png" />
+  <link rel="stylesheet" href="/static/omniswarm.css" />
+  <style>
+    .sub { color:var(--muted); font-size:12px; padding:18px 32px 0; }
+    .hero { display:flex; gap:32px; padding:24px 32px; flex-wrap:wrap; }
+    .stat .n { font-size:34px; font-weight:700; color:var(--accent); }
+    .stat .n.sm { font-size:18px; }
+    .stat .l { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+    .panels { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; padding:8px 32px 8px; }
+    .panels .card h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); }
+    .bar { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; margin:6px 0; }
+    .bar .lbl { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .bar .track { grid-column:1 / -1; height:6px; background:#1f1f1f; border-radius:3px; overflow:hidden; }
+    .bar .fill { height:100%; background:var(--accent); }
+    .bar .fill.blue { background:var(--blue); }
+    .bar .fill.amber { background:var(--amber); }
+    .bar .cnt { font-size:12px; color:var(--muted); }
+    .wrap { padding:8px 32px 40px; }
+    table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+    td { font-size:13px; }
+    tr.jobrow { cursor:pointer; }
+    tr.jobrow:hover td { background:var(--panel); }
+    tr.jobrow td:first-child::before { content:"\25B8  "; color:var(--muted); }
+    tr.jobrow.open td:first-child::before { content:"\25BE  "; color:var(--accent); }
+    .empty { color:var(--muted); padding:24px 12px; }
+    footer { color:var(--muted); font-size:11px; padding:0 32px 28px; }
+    tr.detail > td { background:var(--panel2); padding:0 12px 14px; }
+    .dwrap { display:grid; grid-template-columns:120px 1fr; gap:6px 16px; padding:8px 0 4px; }
+    .dlabel { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; padding-top:6px; }
+    .dbox { background:#111; border:1px solid var(--line); border-radius:6px; padding:8px 10px; white-space:pre-wrap; word-break:break-word; font-size:13px; }
+    .dbox.warn { color:var(--amber); border-color:var(--amber); }
+    .timeline { display:flex; flex-direction:column; gap:0; }
+    .tstep { display:grid; grid-template-columns:130px 1fr; gap:12px; padding:8px 0; border-left:2px solid var(--line); padding-left:14px; margin-left:6px; position:relative; }
+    .tstep::before { content:""; position:absolute; left:-6px; top:12px; width:10px; height:10px; border-radius:50%; background:var(--accent); }
+    .tstep.j::before { background:var(--blue); } .tstep.c::before { background:var(--amber); }
+    .tstage { font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--fg); }
+    .tmodel { font-size:11px; color:var(--muted); margin-top:2px; word-break:break-all; }
+    .tdetail { font-size:12px; color:var(--muted); white-space:pre-wrap; word-break:break-word; }
+    .tscore { color:var(--accent); }
+    .console { padding:8px 32px 0; }
+    .console .card { padding:16px; }
+    .console h2 { margin:0 0 12px; font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); }
+    .console .row { display:grid; grid-template-columns:1fr 170px auto; gap:12px; align-items:end; }
+    .console label { display:block; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:5px; }
+    .console textarea { width:100%; min-height:60px; resize:vertical; background:#111; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:10px 12px; font:13px ui-monospace,monospace; }
+    .console textarea:focus, .console select:focus { outline:none; border-color:var(--accent); }
+    .console select { width:100%; background:#111; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:10px; font:13px ui-monospace,monospace; }
+    .console .run { background:var(--accent); color:#05140d; border:none; border-radius:8px; padding:11px 22px; font-weight:700; cursor:pointer; }
+    .console .run:disabled { opacity:.5; cursor:default; }
+    .console .result { margin-top:12px; display:none; background:#111; border:1px solid var(--line); border-radius:8px; padding:11px 13px; }
+    .console .result .meta { font-size:12px; color:var(--muted); margin-bottom:7px; }
+    .console .result .ans { white-space:pre-wrap; word-break:break-word; font-size:13px; }
+    .filters { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:8px 32px 0; }
+    .filters select, .filters input { background:#111; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:8px 10px; font:12px ui-monospace,monospace; }
+    .filters input { min-width:200px; }
+    .filters select:focus, .filters input:focus { outline:none; border-color:var(--accent); }
+    .filters .btn { background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:8px; padding:8px 12px; cursor:pointer; font-size:12px; }
+    .filters .btn:hover { color:var(--fg); border-color:var(--fg); }
+    .filters .btn.on { color:var(--amber); border-color:var(--amber); }
+    .filters .spacer { flex:1; }
+    .rel { padding:0 32px 8px; }
+    .rel table { width:100%; border-collapse:collapse; }
+    .rel th, .rel td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); font-size:12px; }
+    .rel th { color:var(--muted); text-transform:uppercase; letter-spacing:1px; font-size:11px; }
+    .rel .pct { font-weight:700; }
+    .rel .pct.good { color:var(--green); } .rel .pct.mid { color:var(--amber); } .rel .pct.bad { color:var(--red); }
+    .rel .r429 { color:var(--amber); }
+    #live { color:var(--grey); }
+    #live.on { color:var(--green); }
+    #live .dot { font-size:9px; vertical-align:middle; }
+    .livewrap { padding:8px 32px 0; }
+    .livewrap .card { padding:12px 16px; }
+    .livewrap h2 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); }
+    #livefeed { display:flex; flex-direction:column; gap:4px; max-height:180px; overflow:auto; }
+    .lf { font-size:12px; display:flex; gap:8px; align-items:baseline; }
+    .lf .lf-stage { color:var(--accent); min-width:120px; }
+    .lf .lf-id { color:var(--grey); }
+    .lf .lf-txt { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .lf-empty { color:var(--muted); font-size:12px; }
+  </style>
+</head>
+<body>
+  <nav class="nav">
+    <a class="brand" href="/">OMNI<span class="dot">·</span>SWARM</a>
+    <div class="links">
+      <a href="/" class="active">Dashboard</a>
+      <a href="/control-panel">Control Panel</a>
+    </div>
+  </nav>
+
+  <div class="sub">offload · council · verify — every job is glass-box: see which free models did the work and how it was QC'd</div>
+
+  <section class="console">
+    <div class="card">
+      <h2>Run a job</h2>
+      <div class="row">
+        <div>
+          <label>Prompt</label>
+          <textarea id="c-prompt" placeholder="Ask the swarm something — it routes to a free model and the council QCs it…"></textarea>
+        </div>
+        <div>
+          <label>Task type</label>
+          <select id="c-task">
+            <option value="general">general</option>
+            <option value="summarize">summarize</option>
+            <option value="classify">classify</option>
+            <option value="draft">draft</option>
+            <option value="code">code</option>
+            <option value="reasoning">reasoning</option>
+          </select>
+        </div>
+        <button class="run" id="c-run">Run</button>
+      </div>
+      <div class="result" id="c-result"><div class="meta" id="c-meta"></div><div class="ans" id="c-ans"></div></div>
+    </div>
+  </section>
+
+  <section class="livewrap">
+    <div class="card">
+      <h2>Live activity <span id="live"><span class="dot" style="font-size:9px">●</span> connecting…</span></h2>
+      <div id="livefeed"><div class="lf-empty">Waiting for jobs… run one above or from an agent and watch the council work here.</div></div>
+    </div>
+  </section>
+
+  <section class="hero">
+    <div class="stat"><div class="n" id="saved">—</div><div class="l">≈ Claude tokens saved</div></div>
+    <div class="stat"><div class="n" id="jobs">—</div><div class="l">jobs processed</div></div>
+    <div class="stat"><div class="n" id="avg">—</div><div class="l">avg saved / job</div></div>
+    <div class="stat"><div class="n" id="calls">—</div><div class="l">free model calls</div></div>
+    <div class="stat"><div class="n" id="council">—</div><div class="l">council-escalated</div></div>
+    <div class="stat"><div class="n sm" id="topmodel">—</div><div class="l">most-used model</div></div>
+  </section>
+
+  <section class="panels">
+    <div class="card"><h2>Free models at work</h2><div id="p-models"></div></div>
+    <div class="card"><h2>Task types</h2><div id="p-tasks"></div></div>
+    <div class="card"><h2>Confidence</h2><div id="p-conf"></div></div>
+  </section>
+
+  <section class="rel">
+    <div class="card">
+      <h2 style="margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);">Model reliability</h2>
+      <table>
+        <thead><tr><th>Model</th><th>Calls</th><th>Success</th><th>Avg latency</th><th>429s</th></tr></thead>
+        <tbody id="p-reliability"><tr><td class="muted" colspan="5">—</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="filters">
+    <select id="f-status"><option value="">all status</option><option value="done">done</option><option value="escalated">escalated</option><option value="failed">failed</option><option value="running">running</option></select>
+    <select id="f-verdict"><option value="">all verdicts</option><option value="pass">pass</option><option value="escalated">escalated</option><option value="failed">failed</option></select>
+    <select id="f-task"><option value="">all tasks</option><option value="general">general</option><option value="summarize">summarize</option><option value="classify">classify</option><option value="draft">draft</option><option value="code">code</option><option value="reasoning">reasoning</option></select>
+    <input type="text" id="f-search" placeholder="search input / output…" />
+    <button class="btn" id="f-triage">⚠ Escalated/failed only</button>
+    <span class="spacer"></span>
+    <button class="btn" id="f-csv">Export CSV</button>
+    <button class="btn" id="f-json">Export JSON</button>
+  </div>
+
+  <div class="wrap">
+    <table>
+      <thead><tr><th>Job</th><th>Task</th><th>Status</th><th>Verdict</th><th>Confidence</th><th>Saved</th><th>When</th></tr></thead>
+      <tbody id="rows"><tr><td class="empty" colspan="7">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <footer>click a row for full provenance · auto-refreshing · <span id="ts"></span></footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const OPEN = new Set();
+    let JOBS = [];
+    const esc = (s) => (s == null ? "" : String(s)).replace(/[&<>]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;" }[c]));
+    const badge = (v) => `<span class="badge b-${(v||"none")}">${esc(v||"none")}</span>`;
+    const ago = (t) => { const s=Math.max(0,Math.floor(Date.now()/1000-t));
+      if(s<60)return s+"s ago"; if(s<3600)return Math.floor(s/60)+"m ago"; return Math.floor(s/3600)+"h ago"; };
+
+    function tok() { return localStorage.getItem("omniswarm_token") || ""; }
+    function authedUrl(u) { const t = tok(); return t ? u + (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t) : u; }
+
+    async function loadReliability() {
+      try {
+        const rel = await fetch(authedUrl("/reliability")).then((r) => r.json());
+        const entries = Object.entries(rel).sort((a, b) => b[1].calls - a[1].calls);
+        const body = $("p-reliability");
+        if (!entries.length) { body.innerHTML = '<tr><td class="muted" colspan="5">no calls yet</td></tr>'; return; }
+        body.innerHTML = entries.map(([model, s]) => {
+          const cls = s.success_pct >= 90 ? "good" : (s.success_pct >= 70 ? "mid" : "bad");
+          return `<tr>
+            <td class="mono">${esc(model)}</td>
+            <td>${s.calls}</td>
+            <td class="pct ${cls}">${s.success_pct}%</td>
+            <td>${Math.round(s.avg_latency_ms)} ms</td>
+            <td class="${s.http_429 ? "r429" : "muted"}">${s.http_429}</td>
+          </tr>`;
+        }).join("");
+      } catch (e) {}
+    }
+
+    let TRIAGE = false;
+    function filterQS() {
+      const p = new URLSearchParams();
+      const st = $("f-status").value, vd = $("f-verdict").value, tk = $("f-task").value, q = $("f-search").value.trim();
+      if (st) p.set("status", st);
+      if (vd) p.set("verdict", vd);
+      if (tk) p.set("task_type", tk);
+      if (q) p.set("q", q);
+      return p.toString();
+    }
+    ["f-status","f-verdict","f-task"].forEach((id) => $(id).addEventListener("change", refresh));
+    $("f-search").addEventListener("input", () => { clearTimeout(window._fd); window._fd = setTimeout(refresh, 350); });
+    $("f-triage").addEventListener("click", () => {
+      TRIAGE = !TRIAGE;
+      $("f-triage").classList.toggle("on", TRIAGE);
+      // triage = show escalated OR failed: approximate by status filter; toggle clears other status
+      $("f-status").value = TRIAGE ? "escalated" : "";
+      refresh();
+    });
+    $("f-csv").addEventListener("click", () => { window.open(authedUrl("/export?format=csv" + (filterQS() ? "&" + filterQS() : "")), "_blank"); });
+    $("f-json").addEventListener("click", () => { window.open(authedUrl("/export?format=json" + (filterQS() ? "&" + filterQS() : "")), "_blank"); });
+
+    function showResult(metaHtml, ans) {
+      $("c-result").style.display = "block";
+      $("c-meta").innerHTML = metaHtml;     // badge() output is pre-escaped
+      $("c-ans").textContent = ans;         // answer as plain text (safe)
+    }
+    $("c-run").addEventListener("click", async () => {
+      const prompt = $("c-prompt").value.trim();
+      if (!prompt) return;
+      const task = $("c-task").value;
+      const btn = $("c-run"); btn.disabled = true; btn.textContent = "Running…";
+      try {
+        const res = await fetch(authedUrl("/v1/chat/completions"), {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "omniswarm", messages: [{ role: "user", content: prompt }], omniswarm: { task_type: task } }),
+        });
+        if (res.status === 401) { showResult("unauthorized — set the token in the Control Panel", ""); return; }
+        const d = await res.json();
+        const om = d.omniswarm || {};
+        const ans = (d.choices && d.choices[0] && d.choices[0].message.content) || "";
+        showResult(`${badge(om.verdict)} ${badge(om.confidence)} · ${(om.tokens_saved || 0)} tokens saved · ${(om.models_used || []).length} models`, ans);
+        refresh();
+      } catch (e) { showResult("error — is the gateway reachable?", ""); }
+      finally { btn.disabled = false; btn.textContent = "Run"; }
+    });
+
+    function bars(obj, cls) {
+      const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
+      if (!entries.length) return '<div class="muted">—</div>';
+      const max = Math.max(...entries.map((e) => e[1]));
+      return entries.map(([k, v]) => `
+        <div class="bar">
+          <div class="lbl">${esc(k)}</div><div class="cnt">${v}</div>
+          <div class="track"><div class="fill ${cls||''}" style="width:${Math.round((v/max)*100)}%"></div></div>
+        </div>`).join("");
+    }
+
+    function timeline(steps) {
+      if (!steps || !steps.length) return '<span class="muted">—</span>';
+      return '<div class="timeline">' + steps.map((s) => {
+        const cls = s.stage === "judge" ? "j" : (s.stage === "synthesis" || s.stage === "council" || s.stage === "review" ? "c" : "");
+        const role = s.role ? ` · ${esc(s.role)}` : "";
+        const score = (s.score != null) ? ` <span class="tscore">score ${s.score}${s.action ? " · " + esc(s.action) : ""}</span>` : "";
+        const conf = s.confidence ? ` <span class="tscore">${esc(s.confidence)}</span>` : "";
+        return `<div class="tstep ${cls}">
+            <div><div class="tstage">${esc(s.stage)}${role}${score}${conf}</div>${s.model ? `<div class="tmodel">${esc(s.model)}</div>` : ""}</div>
+            <div class="tdetail">${esc(s.detail) || ""}</div>
+          </div>`;
+      }).join("") + "</div>";
+    }
+
+    function detailHtml(j) {
+      let steps = [];
+      try { steps = JSON.parse(j.provenance || "[]"); } catch (e) {}
+      const note = j.note ? `<div class="dlabel">Note</div><div class="dbox warn">${esc(j.note)}</div>` : "";
+      return `<div class="dwrap">
+        <div class="dlabel">Input</div><div class="dbox">${esc(j.input) || '<span class="muted">—</span>'}</div>
+        <div class="dlabel">Output</div><div class="dbox">${esc(j.result) || '<span class="muted">—</span>'}</div>
+        <div class="dlabel">Provenance</div><div class="dbox">${timeline(steps)}</div>
+        ${note}
+      </div>`;
+    }
+
+    function renderRows() {
+      const rows = $("rows");
+      if (!JOBS.length) { rows.innerHTML = '<tr><td class="empty" colspan="7">No jobs yet. Send one to /v1/chat/completions.</td></tr>'; return; }
+      rows.innerHTML = JOBS.map((j) => {
+        const open = OPEN.has(j.id);
+        return `<tr class="jobrow${open ? " open" : ""}" data-id="${esc(j.id)}">
+            <td class="mono muted">${esc(j.id)}</td><td>${esc(j.task_type)}</td>
+            <td>${badge(j.status)}</td><td>${badge(j.verdict)}</td><td>${badge(j.confidence)}</td>
+            <td>${(j.tokens_saved||0).toLocaleString()}</td><td class="muted">${ago(j.created_at)}</td>
+          </tr>
+          <tr class="detail" data-detail="${esc(j.id)}" style="display:${open ? "table-row" : "none"}"><td colspan="7">${detailHtml(j)}</td></tr>`;
+      }).join("");
+      document.querySelectorAll("tr.jobrow").forEach((r) => r.addEventListener("click", () => {
+        const id = r.dataset.id; if (OPEN.has(id)) OPEN.delete(id); else OPEN.add(id); renderRows();
+      }));
+    }
+
+    async function refresh() {
+      try {
+        const [stats, jobs] = await Promise.all([
+          fetch(authedUrl("/stats")).then((r) => r.json()),
+          fetch(authedUrl("/jobs?limit=50" + (filterQS() ? "&" + filterQS() : ""))).then((r) => r.json()),
+        ]);
+        $("saved").textContent = (stats.tokens_saved || 0).toLocaleString();
+        $("jobs").textContent = stats.total_jobs || 0;
+        $("avg").textContent = stats.avg_tokens_saved || 0;
+        $("calls").textContent = stats.total_model_calls || 0;
+        $("council").textContent = stats.council_engaged || 0;
+        $("topmodel").textContent = stats.most_used_model || "—";
+        $("p-models").innerHTML = bars(stats.by_model, "");
+        $("p-tasks").innerHTML = bars(stats.by_task_type, "blue");
+        $("p-conf").innerHTML = bars(stats.by_confidence, "amber");
+        JOBS = jobs; renderRows(); loadReliability();
+        $("ts").textContent = "updated " + new Date().toLocaleTimeString();
+      } catch (e) { $("ts").textContent = "connection error — retrying…"; }
+    }
+    refresh();
+    setInterval(refresh, 4000);
+
+    // live updates via SSE — refresh instantly on job events
+    function pushFeed(ev) {
+      const feed = $("livefeed");
+      const empty = feed.querySelector(".lf-empty");
+      if (empty) empty.remove();
+      const extra = [];
+      if (ev.role) extra.push(esc(ev.role));
+      if (ev.model) extra.push(esc(ev.model));
+      if (ev.score != null) extra.push("score " + ev.score);
+      if (ev.confidence) extra.push(esc(ev.confidence));
+      const txt = [esc(ev.detail || ""), extra.length ? "(" + extra.join(" · ") + ")" : ""].filter(Boolean).join(" ");
+      const row = document.createElement("div");
+      row.className = "lf";
+      row.innerHTML = `<span class="lf-stage">${esc(ev.stage || "")}</span><span class="lf-id">${esc((ev.job_id || "").slice(0, 8))}</span><span class="lf-txt">${txt}</span>`;
+      feed.prepend(row);
+      while (feed.children.length > 15) feed.removeChild(feed.lastChild);
+    }
+    function connectLive() {
+      try {
+        const es = new EventSource(authedUrl("/stream"));
+        es.onopen = () => { $("live").className = "on"; $("live").innerHTML = '<span class="dot" style="font-size:9px">●</span> live'; };
+        es.onmessage = (m) => {
+          let ev = null;
+          try { ev = JSON.parse(m.data); } catch (e) { return; }
+          if (ev.type === "step") { pushFeed(ev); }
+          else { clearTimeout(window._sd); window._sd = setTimeout(refresh, 150); }
+        };
+        es.onerror = () => { $("live").className = ""; $("live").innerHTML = '<span class="dot" style="font-size:9px">●</span> reconnecting…'; };
+      } catch (e) {}
+    }
+    connectLive();
+  </script>
+</body>
+</html>

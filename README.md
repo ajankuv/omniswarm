@@ -3,6 +3,7 @@
 
   <p><em>A trust layer over cheap compute.</em></p>
 
+  <a href="https://github.com/ajankuv/omniswarm/actions/workflows/build.yml"><img src="https://github.com/ajankuv/omniswarm/actions/workflows/build.yml/badge.svg" alt="build"></a>
   <img src="https://img.shields.io/badge/License-MIT-9acd32" alt="MIT License">
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/API-OpenAI--compatible-black" alt="OpenAI-compatible">
@@ -15,6 +16,21 @@ Quality AI is expensive. Most teams either pay for every token with a premium mo
 
 The point is access. People who can't afford to run heavy AI on every call can now offload work for free and still get a vetted result back.
 
+## See it work
+
+Every job is glass-box. Below, the judge scores a draft **0**, forces a fix, and the corrected answer ships with a `pass · high` verdict — the full provenance timeline is recorded per job:
+
+![A job's provenance timeline: draft, validate, judge-forced fix, council](assets/screenshot-job.png)
+
+The live dashboard tracks tokens saved, which free models did the work, and per-model reliability:
+
+![OmniSwarm dashboard](assets/screenshot-dashboard.png)
+
+And the Model Picker recommends the best free model per slot — backed by your own benchmarks and success history, applied live with no restart:
+
+![Model Picker with evidence-backed recommendations](assets/screenshot-model-picker.png)
+
+
 ---
 
 ## What OmniSwarm provides
@@ -22,6 +38,7 @@ The point is access. People who can't afford to run heavy AI on every call can n
 - **OpenAI-compatible API** (`POST /v1/chat/completions`) — drop-in endpoint; runs the council and returns a standard OpenAI response plus an `omniswarm` block with verdict, confidence, and token savings.
 - **Fire-and-forget job API** — submit a job and get an ID immediately; poll for the result, stream live updates via SSE, or export to JSON/CSV.
 - **Adaptive-tiered council** — deterministic validators (with an auto-fix attempt) → judge → role-based review board → synthesis. Escalates only when needed; every step is logged as a per-job provenance timeline.
+- **Automatic failover** — when a pinned model keeps failing at the gateway, every slot that uses it (task types, judge, council) swaps live to the top-ranked healthy alternative, persisted and reviewable in the Model Picker, with a dashboard banner. Free providers flake; your jobs keep flowing.
 - **Task types** — `general · summarize · classify · draft · code · reasoning`, each with a pinned model and a QC rubric. `reasoning` always runs the full council.
 - **Live dashboard** (`GET /`) — tokens-saved hero stat, searchable/filterable job list with JSON/CSV export, per-job provenance timeline, model leaderboard, and real-time SSE updates.
 - **Control Panel** (`GET /control-panel`) — everything configurable live, no restart: API token, rate limit, privacy mode, council roster, scheduled jobs, Model Picker, Benchmark, and active config view.
@@ -164,6 +181,7 @@ Copy `omniswarm.toml.example` to `omniswarm.toml` (or set `OMNISWARM_CONFIG=/pat
 | `OMNISWARM_DB_PATH` | SQLite database path |
 | `OMNISWARM_MAX_CONCURRENT_JOBS` | Concurrency cap |
 | `OMNISWARM_SCHED_INTERVAL` | Scheduler poll interval (seconds) |
+| `OMNISWARM_FAILOVER_THRESHOLD` | Consecutive failed gateway calls before auto-failover (default `6` ≈ two failed requests; `0` disables) |
 | `OMNISWARM_REMOTE` | MCP observable mode — route through deployed app |
 | `OMNISWARM_REMOTE_TOKEN` | Token for the remote instance (MCP observable mode) |
 
@@ -174,6 +192,10 @@ See `.env.example` for all variables and their defaults.
 The Control Panel's **Model Picker** lists every model your gateway exposes (live catalog), recommends the best fit per task type / judge / council role, and applies your choice at runtime — no rebuild or restart. Runtime picks persist in `omniswarm.runtime.json` and override `omniswarm.toml` defaults.
 
 Recommendations blend three signals: capability metadata from the gateway's `/models` endpoint, your own success/latency history, and — when available — benchmark scores.
+
+### Automatic failover
+
+Free-tier providers go down without warning. When any pinned model racks up consecutive gateway failures, OmniSwarm automatically swaps **every slot using it** — task types, judge, council chair, members — to the top-ranked healthy alternative (excluding anything currently failing, cooling down, or proven dead). The swap goes through the same persisted runtime-override path as the Model Picker, so it survives restarts and is visible and undoable in the Control Panel. A dismissible banner appears on the dashboard when it fires. There is no silent auto-restore: you switch back via the picker (or let a fresh benchmark make the case).
 
 ---
 
@@ -306,3 +328,17 @@ GET /stats          → aggregate offload totals and tokens saved
 ```
 
 Both are surfaced in the live dashboard's model leaderboard section.
+
+---
+
+## Roadmap — coming soon
+
+- **Multi-gateway support** — register several OpenAI-compatible gateways at once (OmniRoute + Ollama + OpenRouter free tier) with per-gateway model namespaces.
+- **Dollar-value savings** — translate tokens saved into "≈ $X vs premium-model pricing" on the dashboard.
+- **Job webhooks** — notify ntfy/Discord/anything on done / failed / escalated.
+- **A/B compare mode** — run one prompt across several models side-by-side and let the council judge the winner.
+- **Raw task type** — skip the council for trivial calls (frictionless drop-in proxy).
+- **Client-facing streaming** on `/v1/chat/completions`.
+- **OpenClaw integration** — ship the MCP toolset as an OpenClaw skill for $0 offload + verification in agent workflows.
+
+Ideas and issues welcome.

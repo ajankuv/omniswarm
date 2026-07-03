@@ -1,6 +1,6 @@
 [project]
 name = "omniswarm"
-version = "1.0.0"
+version = "1.1.0"
 description = "A trust layer over cheap compute: offload bulk LLM work to free models via OmniRoute, with a council that QCs the result before it costs a Claude token."
 readme = "README.md"
 requires-python = ">=3.11"

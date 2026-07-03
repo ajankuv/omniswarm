@@ -463,3 +463,16 @@ def test_benchmark_rejects_unknown_task_type(client, monkeypatch):
     monkeypatch.setattr(catalog, "get_cached_catalog", fake_cat)
     r = client.post("/benchmark", json={"task_type": "not_a_type", "candidates": ["mistral/devstral-latest"]})
     assert r.status_code == 400
+
+
+def test_failover_wired_into_app(client):
+    from omniswarm import adapters
+    assert client.app.state.failover is not None            # tracker attached at startup
+    assert client.app.state.settings_lock is not None       # shared save lock exists
+    assert adapters._SINK is not None                       # sink installed
+
+
+def test_dashboard_has_failover_banner(client):
+    html = client.get("/").text
+    assert 'id="failover-banner"' in html
+    assert "showFailover" in html

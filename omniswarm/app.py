@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from omniswarm import benchmarks, catalog, engine, events, recommend, registry, runtime, store
+from omniswarm import benchmarks, catalog, engine, events, failover, recommend, registry, runtime, store
 from omniswarm.adapters import OmniRouteError, generate, health
 from omniswarm.config import get_settings
 from omniswarm.util import new_id
@@ -71,7 +71,18 @@ def create_app() -> FastAPI:
         app.state.catalog_at = 0.0
         from omniswarm import adapters as _adapters
         _db = settings.db_path
-        _adapters.set_sink(lambda model, ok, lat, status: store.record_model_call(_db, model, ok, lat, status))
+        app.state.failover = failover.FailoverTracker()
+        app.state.settings_lock = asyncio.Lock()
+
+        def _sink(model, ok, lat, status):
+            store.record_model_call(_db, model, ok, lat, status)
+            if app.state.failover.record(model, ok):
+                # sink runs inside the event loop (called from async generate)
+                task = asyncio.get_running_loop().create_task(failover.execute(app, model))
+                app.state.bg_tasks.add(task)
+                task.add_done_callback(app.state.bg_tasks.discard)
+
+        _adapters.set_sink(_sink)
         try:
             app.state.omniroute_ok = await health(app.state.client, settings.omniroute_base_url)
         except Exception:
@@ -336,9 +347,11 @@ def create_app() -> FastAPI:
                 rt["members"] = [{"role": str(m["role"]), "model": m["model"]}
                                  for m in body["members"]
                                  if isinstance(m, dict) and "role" in m and _valid(m.get("model"))]
-        runtime.save_runtime(None, rt)
-        app.state.runtime = rt
-        registry.apply_runtime(rt)
+        # serialize with auto-failover so concurrent saves can't clobber each other
+        async with app.state.settings_lock:
+            runtime.save_runtime(None, rt)
+            app.state.runtime = rt
+            registry.apply_runtime(rt)
         return {"ok": True, "protected": bool(rt.get("api_token")),
                 "rate_limit_per_min": rt["rate_limit_per_min"], "store_mode": rt["store_mode"],
                 "active_roster": rt.get("active_roster", []),

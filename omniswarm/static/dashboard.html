@@ -80,6 +80,14 @@
     .livewrap .card { padding:12px 16px; }
     .livewrap h2 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); }
     #livefeed { display:flex; flex-direction:column; gap:4px; max-height:180px; overflow:auto; }
+    #failover-banner { display:none; align-items:center; gap:10px; margin:0 0 14px;
+      background:rgba(251,191,36,.08); border:1px solid var(--amber); border-radius:10px;
+      padding:10px 14px; font-size:13px; color:var(--amber); }
+    #failover-banner.show { display:flex; }
+    #failover-banner b { color:var(--fg); }
+    #failover-banner .fo-close { margin-left:auto; background:transparent; border:1px solid var(--line);
+      color:var(--muted); border-radius:6px; padding:2px 9px; cursor:pointer; font-size:12px; }
+    #failover-banner .fo-close:hover { color:var(--fg); border-color:var(--amber); }
     .lf { font-size:12px; display:flex; gap:8px; align-items:baseline; }
     .lf .lf-stage { color:var(--accent); min-width:120px; }
     .lf .lf-id { color:var(--grey); }
@@ -122,6 +130,8 @@
       <div class="result" id="c-result"><div class="meta" id="c-meta"></div><div class="ans" id="c-ans"></div></div>
     </div>
   </section>
+
+  <div id="failover-banner"></div>
 
   <section class="livewrap">
     <div class="card">
@@ -354,12 +364,25 @@
           let ev = null;
           try { ev = JSON.parse(m.data); } catch (e) { return; }
           if (ev.type === "step") { pushFeed(ev); }
+          else if (ev.type === "failover") { showFailover(ev); }
           else { clearTimeout(window._sd); window._sd = setTimeout(refresh, 150); }
         };
         es.onerror = () => { $("live").className = ""; $("live").innerHTML = '<span class="dot" style="font-size:9px">●</span> reconnecting…'; };
       } catch (e) {}
     }
     connectLive();
+
+    function showFailover(ev) {
+      const el = $("failover-banner");
+      const swaps = ev.swaps && Object.keys(ev.swaps).length
+        ? Object.entries(ev.swaps).map(([slot, to]) => `${esc(slot)} → <b>${esc(to)}</b>`).join(" · ")
+        : "no healthy replacement found";
+      el.innerHTML = `⚠ <b>auto-failover</b>: <b>${esc(ev.from || "?")}</b> kept failing — ${swaps}
+        <span style="color:var(--muted)">(review in the Control Panel · Model Picker)</span>
+        <button class="fo-close" type="button">dismiss</button>`;
+      el.classList.add("show");
+      el.querySelector(".fo-close").addEventListener("click", () => el.classList.remove("show"));
+    }
   </script>
 </body>
 </html>

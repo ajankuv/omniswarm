@@ -3,7 +3,7 @@
 # no caches, no tests/docs. Plain `uvicorn` (not [standard]) to keep it small.
 
 # ---- builder: install runtime deps into an isolated venv ----
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir \
@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     "pydantic>=2.6"
 
 # ---- runtime: copy the venv + the package onto a clean base ----
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \

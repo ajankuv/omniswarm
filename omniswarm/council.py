@@ -49,7 +49,8 @@ _JUDGE_SYS = (
 async def judge(client, base_url, model, rubric, user_input, candidate) -> JudgeResult:
     user = f"RUBRIC:\n{rubric}\n\nTASK:\n{user_input}\n\nCANDIDATE ANSWER:\n{candidate}"
     raw = await generate(client, base_url, model, _JUDGE_SYS, user, max_tokens=300)
-    data = extract_json(raw) or {}
+    # key-scoped: the prompt embeds the task + draft, so echoed text must not forge a verdict
+    data = extract_json(raw, require_keys=("action", "score")) or {}
     try:
         score = float(data.get("score", 0.0))
     except (TypeError, ValueError):
@@ -79,7 +80,7 @@ async def _member_review(client, base_url, member, user_input, candidate) -> dic
     sys = _MEMBER_SYS.format(role=member["role"], focus=member.get("focus", ""))
     user = f"TASK:\n{user_input}\n\nDRAFT ANSWER:\n{candidate}"
     raw = await generate(client, base_url, member["model"], sys, user, max_tokens=300)
-    data = extract_json(raw) or {}
+    data = extract_json(raw, require_keys=("verdict", "issues")) or {}
     verdict = data.get("verdict", "revise")
     if verdict not in {"approve", "revise", "reject"}:
         verdict = "revise"
@@ -115,7 +116,7 @@ async def run_council(client, base_url, members, synth_model, user_input, candid
     critiques = "\n\n".join(f'[{r["role"]} — {r["verdict"]}] {r["issues"]}' for r in ok)
     synth_user = f"TASK:\n{user_input}\n\nDRAFT ANSWER:\n{candidate}\n\nCRITIQUES:\n{critiques}"
     raw = await generate(client, base_url, synth_model, _SYNTH_SYS, synth_user, max_tokens=800)
-    data = extract_json(raw) or {}
+    data = extract_json(raw, require_keys=("answer", "disagreement")) or {}
     answer = str(data.get("answer", candidate))
     disagreement = str(data.get("disagreement", "")).strip()
     any_reject = any(r["verdict"] == "reject" for r in ok)

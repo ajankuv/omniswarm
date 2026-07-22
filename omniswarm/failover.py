@@ -37,10 +37,17 @@ class FailoverTracker:
         if self.threshold <= 0:
             return False
         if ok:
+            # visibility: a success wiping a building failure streak is exactly what a
+            # postmortem needs to see (it explains why a failover did NOT fire)
+            if self._fails.get(model):
+                log.warning("failover counter reset: %s succeeded after %d consecutive failures",
+                            model, self._fails[model])
             self._fails[model] = 0
             return False
         n = self._fails.get(model, 0) + 1
         self._fails[model] = n
+        if n * 2 >= self.threshold:
+            log.warning("failover counter: %s at %d/%d consecutive failures", model, n, self.threshold)
         if n >= self.threshold and model not in self._in_flight:
             self._in_flight.add(model)
             self._tripped_at[model] = time.time()

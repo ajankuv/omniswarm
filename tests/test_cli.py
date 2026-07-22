@@ -24,7 +24,7 @@ async def test_run_batch_writes_jsonl(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.engine, "process_job", fake_process)
 
     out = tmp_path / "results.jsonl"
-    settings = Settings("http://x/v1", str(tmp_path / "db.sqlite"), 3, 60, 20)
+    settings = Settings("http://x/v1", str(tmp_path / "db.sqlite"), 3, 60, 20, False, 0.0, "high", 5000, 5.0)
     results = await cli.run_batch(["a", "b", "c"], "summarize", str(out), 2, settings)
 
     assert len(results) == 3

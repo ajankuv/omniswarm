@@ -30,7 +30,7 @@ async def test_stats_tool_returns_savings(monkeypatch):
     monkeypatch.setattr(mcp_server.store, "init_db", lambda p: None)
     monkeypatch.setattr(
         mcp_server.store, "stats",
-        lambda p: {"total_jobs": 3, "tokens_saved": 99, "by_status": {}, "by_verdict": {}},
+        lambda p, rate=0.0: {"total_jobs": 3, "tokens_saved": 99, "by_status": {}, "by_verdict": {}},
     )
     out = await mcp_server.omniswarm_stats()
     assert out["tokens_saved"] == 99
@@ -303,3 +303,16 @@ async def test_remote_delegate_missing_job_id_returns_error(monkeypatch):
     monkeypatch.setattr(mcp_server, "_remote_post", fake_post)
     out = await mcp_server.omniswarm_delegate("x", "general")
     assert out["status"] == "error" and "job_id" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_feedback_tool_records(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mcp_server.store, "init_db", lambda p: None)
+    def fake_set(path, jid, val):
+        seen["call"] = (jid, val)
+        return True
+    monkeypatch.setattr(mcp_server.store, "set_feedback", fake_set)
+    out = await mcp_server.omniswarm_feedback("j1", correct=False)
+    assert out["ok"] is True and out["feedback"] == "down"
+    assert seen["call"] == ("j1", "down")

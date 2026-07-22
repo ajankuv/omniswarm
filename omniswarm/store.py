@@ -3,7 +3,14 @@ import sqlite3
 import time
 from omniswarm.util import new_id
 
-_ALLOWED = {"status", "verdict", "confidence", "result", "tokens_saved", "note", "input", "models_used", "provenance"}
+_ALLOWED = {"status", "verdict", "confidence", "result", "tokens_saved", "note",
+            "input", "models_used", "provenance", "feedback", "cache_key"}
+
+# Marker written on jobs answered from the verified cache. Single-sourced because
+# calibration must EXCLUDE these: a cache hit replays a prior council verdict
+# without re-running the council, so counting it would multiply one decision into
+# many data points and corrupt the track-record.
+CACHE_HIT_NOTE = "served from verified cache"
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -80,8 +87,20 @@ def init_db(path: str) -> None:
                 ts REAL NOT NULL
             )"""
         )
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS answer_cache (
+                key TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                result TEXT,
+                verdict TEXT,
+                confidence TEXT,
+                models_used TEXT,
+                hits INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            )"""
+        )
         existing = {r["name"] for r in con.execute("PRAGMA table_info(jobs)")}
-        for col in ("input", "models_used", "provenance"):
+        for col in ("input", "models_used", "provenance", "feedback", "cache_key"):
             if col not in existing:
                 con.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         con.commit()
@@ -173,6 +192,155 @@ def total_tokens_saved(path: str) -> int:
         con.close()
 
 
+# --- Feature A: verdict feedback + calibration -----------------------------
+
+def set_feedback(path: str, job_id: str, value: str) -> bool:
+    """Record human/agent feedback on a finished job: "up" (correct) or "down"
+    (wrong). A "down" also evicts the job's cached answer, if any, so a bad
+    verified-cache entry cannot keep being served. Returns False if no such job."""
+    if value not in ("up", "down"):
+        raise ValueError(f"feedback must be 'up' or 'down', got {value!r}")
+    con = _connect(path)
+    try:
+        row = con.execute("SELECT cache_key FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return False
+        con.execute("UPDATE jobs SET feedback=?, updated_at=? WHERE id=?",
+                    (value, time.time(), job_id))
+        if value == "down" and row["cache_key"]:
+            con.execute("DELETE FROM answer_cache WHERE key=?", (row["cache_key"],))
+        con.commit()
+        return True
+    finally:
+        con.close()
+
+
+def calibration(path: str) -> dict:
+    """For jobs that carry feedback, bucket by the confidence claimed at
+    issue-time and report how often that confidence was actually correct.
+    This is the trust track-record: does "high" really mean high?
+
+    Cache-hit jobs are excluded: they replay a council verdict that was already
+    counted when it was first issued, so including them would let one decision
+    contribute arbitrarily many data points. Feedback on a cache hit still
+    matters — it evicts the entry (see set_feedback)."""
+    buckets: dict[str, dict] = {}
+    con = _connect(path)
+    try:
+        rows = con.execute(
+            "SELECT COALESCE(confidence,'none') AS c, feedback, COUNT(*) AS n "
+            "FROM jobs WHERE feedback IS NOT NULL AND COALESCE(note,'') != ? "
+            "GROUP BY c, feedback", (CACHE_HIT_NOTE,)
+        ).fetchall()
+        for r in rows:
+            b = buckets.setdefault(r["c"], {"up": 0, "down": 0})
+            b[r["feedback"]] = r["n"]
+        out = {}
+        total_up = total = 0
+        for c, b in buckets.items():
+            n = b["up"] + b["down"]
+            out[c] = {"correct": b["up"], "wrong": b["down"], "total": n,
+                      "pct_correct": round(100 * b["up"] / n, 1) if n else 0.0}
+            total_up += b["up"]; total += n
+        return {"by_confidence": out, "total_rated": total,
+                "overall_pct": round(100 * total_up / total, 1) if total else 0.0}
+    finally:
+        con.close()
+
+
+# --- Feature B: verified-answer cache --------------------------------------
+
+def cache_get(path: str, key: str, ttl_seconds: float) -> dict | None:
+    """Return a fresh cached answer for this key (and bump its hit count), or
+    None if absent or older than ttl_seconds."""
+    con = _connect(path)
+    try:
+        row = con.execute("SELECT * FROM answer_cache WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        if ttl_seconds and (time.time() - row["created_at"]) > ttl_seconds:
+            return None
+        con.execute("UPDATE answer_cache SET hits=hits+1 WHERE key=?", (key,))
+        con.commit()
+        return dict(row)
+    finally:
+        con.close()
+
+
+def cache_prune(path: str, ttl_seconds: float = 0.0, max_entries: int = 0) -> int:
+    """Keep the cache bounded. Drops entries past their TTL, then — if still over
+    max_entries — evicts the least-useful ones. Eviction ranks by hit count first
+    so a hot entry is not thrown away just for being old. Returns rows deleted.
+
+    Without this the table only ever grows: expired rows are skipped on read but
+    never removed, so every unique pass+high prompt costs disk forever."""
+    deleted = 0
+    con = _connect(path)
+    try:
+        if ttl_seconds and ttl_seconds > 0:
+            cur = con.execute("DELETE FROM answer_cache WHERE created_at < ?",
+                              (time.time() - ttl_seconds,))
+            deleted += cur.rowcount or 0
+        if max_entries and max_entries > 0:
+            n = con.execute("SELECT COUNT(*) AS c FROM answer_cache").fetchone()["c"]
+            if n > max_entries:
+                # SQLite has no DELETE ... LIMIT, so select the keepers by subquery
+                cur = con.execute(
+                    "DELETE FROM answer_cache WHERE key NOT IN "
+                    "(SELECT key FROM answer_cache ORDER BY hits DESC, created_at DESC LIMIT ?)",
+                    (max_entries,),
+                )
+                deleted += cur.rowcount or 0
+        con.commit()
+        return deleted
+    finally:
+        con.close()
+
+
+def cache_put(path: str, key: str, task_type: str, result: str,
+              verdict: str, confidence: str, models_used: str,
+              ttl_seconds: float = 0.0, max_entries: int = 0) -> None:
+    con = _connect(path)
+    try:
+        con.execute(
+            "INSERT INTO answer_cache (key, task_type, result, verdict, confidence, "
+            "models_used, hits, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?) "
+            "ON CONFLICT(key) DO UPDATE SET result=excluded.result, verdict=excluded.verdict, "
+            "confidence=excluded.confidence, models_used=excluded.models_used, "
+            "created_at=excluded.created_at",
+            (key, task_type, result, verdict, confidence, models_used, time.time()),
+        )
+        con.commit()
+    finally:
+        con.close()
+    if ttl_seconds or max_entries:
+        cache_prune(path, ttl_seconds, max_entries)
+
+
+def cache_clear(path: str) -> int:
+    """Drop every cached answer. Called when the privacy mode tightens — cached
+    plaintext must not outlive the setting that allowed it to be stored."""
+    con = _connect(path)
+    try:
+        n = con.execute("SELECT COUNT(*) AS c FROM answer_cache").fetchone()["c"]
+        con.execute("DELETE FROM answer_cache")
+        con.commit()
+        return int(n)
+    finally:
+        con.close()
+
+
+def cache_stats(path: str) -> dict:
+    con = _connect(path)
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(hits),0) AS hits FROM answer_cache"
+        ).fetchone()
+        return {"entries": int(row["entries"]), "hits": int(row["hits"])}
+    finally:
+        con.close()
+
+
 def record_model_call(path: str, model: str, ok: bool, latency_ms: float, status: str) -> None:
     con = _connect(path)
     try:
@@ -243,7 +411,7 @@ def latest_benchmarks(path: str) -> dict:
         con.close()
 
 
-def stats(path: str) -> dict:
+def stats(path: str, usd_per_mtok: float = 0.0) -> dict:
     con = _connect(path)
     try:
         total = con.execute(
@@ -287,6 +455,8 @@ def stats(path: str) -> dict:
         return {
             "total_jobs": n,
             "tokens_saved": saved,
+            "dollars_saved": round(saved / 1_000_000 * usd_per_mtok, 2),
+            "usd_per_mtok": usd_per_mtok,
             "avg_tokens_saved": avg_tokens_saved,
             "total_model_calls": total_calls,
             "most_used_model": most_used_model,

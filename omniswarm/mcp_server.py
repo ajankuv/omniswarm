@@ -157,7 +157,18 @@ async def omniswarm_stats() -> dict:
     """Report what OmniSwarm has worked on: job counts by status and verdict, and the
     approximate number of Claude tokens saved by offloading work to free models."""
     store.init_db(_settings.db_path)
-    return store.stats(_settings.db_path)
+    return store.stats(_settings.db_path, _settings.savings_usd_per_mtok)
+
+
+@_mcp.tool()
+async def omniswarm_feedback(job_id: str, correct: bool) -> dict:
+    """Report whether a finished OmniSwarm job's answer was actually correct.
+    This trains the calibration track-record (does 'high confidence' really mean
+    high?) and evicts wrong answers from the verified-answer cache. Call this
+    after you've used and judged an offloaded result."""
+    store.init_db(_settings.db_path)
+    ok = store.set_feedback(_settings.db_path, job_id, "up" if correct else "down")
+    return {"ok": ok, "job_id": job_id, "feedback": "up" if correct else "down"}
 
 
 @_mcp.tool()

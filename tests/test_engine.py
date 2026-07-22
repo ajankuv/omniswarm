@@ -11,7 +11,7 @@ def settings():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     store.init_db(path)
-    yield Settings("http://x/v1", path, 3, 60, 20)
+    yield Settings("http://x/v1", path, 3, 60, 20, False, 0.0, "high", 5000, 5.0)
     os.remove(path)
 
 
@@ -144,3 +144,63 @@ async def test_process_job_publishes_events(monkeypatch, settings):
     assert "job" in types  # at least a start and/or completion job event
     starts = [e for e in seen if e.get("type") == "job" and e.get("status") == "running"]
     assert starts and starts[0]["job_id"] == out["job_id"]
+
+
+@pytest.fixture()
+def cache_settings():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    store.init_db(path)
+    yield Settings("http://x/v1", path, 3, 60, 20, True, 3600.0, "high", 5000, 5.0)
+    os.remove(path)
+
+
+@pytest.mark.asyncio
+async def test_verified_cache_hit_short_circuits_council(monkeypatch, cache_settings):
+    calls = {"generate": 0, "review": 0}
+    async def fake_generate(*a, **k):
+        calls["generate"] += 1
+        return "candidate"
+    async def fake_review(*a, **k):
+        calls["review"] += 1
+        return council.ReviewResult("pass", "high", "Paris", ["m1"])
+    monkeypatch.setattr(engine, "generate", fake_generate)
+    monkeypatch.setattr(engine, "review", fake_review)
+
+    req = engine.JobRequest("general", "sys", "Capital of France?")
+    first = await engine.process_job(None, cache_settings, req)
+    assert first["cache_hit"] is False and calls["generate"] == 1
+
+    # identical prompt (even reworded case/space) is served from cache, no council
+    again = engine.JobRequest("general", "sys", "  CAPITAL of France?  ")
+    second = await engine.process_job(None, cache_settings, again)
+    assert second["cache_hit"] is True
+    assert second["text"] == "Paris" and second["verdict"] == "pass"
+    assert calls["generate"] == 1 and calls["review"] == 1   # unchanged — no new calls
+    row = store.get_job(cache_settings.db_path, second["job_id"])
+    assert row["note"] == "served from verified cache"
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_and_escalated_not_cached(monkeypatch, cache_settings):
+    async def fake_generate(*a, **k):
+        return "candidate"
+    async def fake_review(*a, **k):
+        return council.ReviewResult("escalated", "low", "unsure", ["m1"])
+    monkeypatch.setattr(engine, "generate", fake_generate)
+    monkeypatch.setattr(engine, "review", fake_review)
+    await engine.process_job(None, cache_settings, engine.JobRequest("general", "s", "hard q"))
+    assert store.cache_stats(cache_settings.db_path)["entries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cache_disabled_never_caches(monkeypatch, settings):
+    async def fake_generate(*a, **k):
+        return "candidate"
+    async def fake_review(*a, **k):
+        return council.ReviewResult("pass", "high", "Paris", ["m1"])
+    monkeypatch.setattr(engine, "generate", fake_generate)
+    monkeypatch.setattr(engine, "review", fake_review)
+    # `settings` fixture has cache_enabled=False
+    await engine.process_job(None, settings, engine.JobRequest("general", "s", "Capital of France?"))
+    assert store.cache_stats(settings.db_path)["entries"] == 0

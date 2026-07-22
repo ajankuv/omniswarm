@@ -119,6 +119,21 @@ def test_stats_has_enriched_keys(client):
         assert k in s
 
 
+def test_stats_reports_dollars_saved(client):
+    client.post("/v1/chat/completions", json={
+        "model": "omniswarm", "messages": [{"role": "user", "content": "hi"}]})
+    s = client.get("/stats").json()
+    # default rate is $5/Mtok (config.py); dollars_saved is derived, non-negative
+    assert s["usd_per_mtok"] == 5.0
+    assert s["dollars_saved"] == round(s["tokens_saved"] / 1_000_000 * 5.0, 2)
+
+
+def test_dashboard_has_dollars_tile(client):
+    html = client.get("/").text
+    assert 'id="dollars"' in html
+    assert "saved vs premium" in html
+
+
 def test_dashboard_has_analytics_markup(client):
     html = client.get("/").text
     assert "Free models at work" in html   # model leaderboard panel
@@ -476,3 +491,78 @@ def test_dashboard_has_failover_banner(client):
     html = client.get("/").text
     assert 'id="failover-banner"' in html
     assert "showFailover" in html
+
+
+def test_feedback_and_calibration_endpoints(client):
+    # create a job via a completion, then rate it
+    client.post("/v1/chat/completions", json={
+        "model": "omniswarm", "messages": [{"role": "user", "content": "hi"}]})
+    jid = client.get("/jobs").json()[0]["id"]
+    r = client.post(f"/jobs/{jid}/feedback", json={"correct": True})
+    assert r.status_code == 200 and r.json()["feedback"] == "up"
+    # unknown job -> 404
+    assert client.post("/jobs/nope/feedback", json={"correct": False}).status_code == 404
+    cal = client.get("/calibration").json()
+    assert cal["total_rated"] == 1
+    assert cal["by_confidence"]["high"]["pct_correct"] == 100.0
+
+
+def test_stats_includes_cache_block(client):
+    s = client.get("/stats").json()
+    assert "cache" in s and set(s["cache"]) == {"entries", "hits"}
+
+
+def test_dashboard_has_calibration_and_feedback_markup(client):
+    html = client.get("/").text
+    assert "Calibration" in html
+    assert "sendFeedback" in html   # the 👍/👎 handler
+
+
+def test_tightening_privacy_mode_purges_cached_plaintext(client):
+    """README promises cached text never outlives your privacy setting."""
+    from omniswarm import store
+    db = client.app.state.settings.db_path
+    store.cache_put(db, "k1", "general", "secret answer", "pass", "high", '["m"]')
+    assert store.cache_stats(db)["entries"] == 1
+    assert client.post("/settings", json={"store_mode": "redact"}).status_code == 200
+    assert store.cache_stats(db)["entries"] == 0        # purged
+    # switching back to full does not resurrect anything
+    client.post("/settings", json={"store_mode": "full"})
+    assert store.cache_stats(db)["entries"] == 0
+
+
+def test_csv_export_neutralizes_formula_injection(client):
+    from omniswarm import store
+    db = client.app.state.settings.db_path
+    store.create_job(db, "evil", "general", "done")
+    store.update_job(db, "evil", status="done", input='=cmd|\'/c calc\'!A0', result="+1+1",
+                     note="@SUM(1)", tokens_saved=-5)
+    csv_text = client.get("/export?format=csv").text
+    assert "'=cmd" in csv_text and "'+1+1" in csv_text and "'@SUM" in csv_text
+    assert "\n=cmd" not in csv_text and ",=cmd" not in csv_text
+
+
+def test_auth_uses_constant_time_compare(monkeypatch, tmp_path):
+    import omniswarm.app as app_module
+    monkeypatch.setenv("OMNISWARM_DB_PATH", str(tmp_path / "d.db"))
+    monkeypatch.setenv("OMNISWARM_RUNTIME", str(tmp_path / "rt.json"))
+    from fastapi.testclient import TestClient
+    with TestClient(app_module.create_app()) as c:
+        c.post("/settings", json={"api_token": "sk-secret"})
+        assert c.get("/jobs").status_code == 401                       # missing
+        assert c.get("/jobs", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert c.get("/jobs", headers={"Authorization": "Bearer sk-secret"}).status_code == 200
+
+
+def test_auth_rejects_non_ascii_token_without_500(monkeypatch, tmp_path):
+    """A non-ASCII token must be a clean 401, not a 500. compare_digest raises
+    TypeError on non-ASCII str; HTTP headers are ASCII-only, but the ?token=
+    query param carries arbitrary unicode, so that is the reachable path."""
+    import omniswarm.app as app_module
+    monkeypatch.setenv("OMNISWARM_DB_PATH", str(tmp_path / "d.db"))
+    monkeypatch.setenv("OMNISWARM_RUNTIME", str(tmp_path / "rt.json"))
+    from fastapi.testclient import TestClient
+    with TestClient(app_module.create_app(), raise_server_exceptions=False) as c:
+        c.post("/settings", json={"api_token": "sk-secret"})
+        r = c.get("/jobs", params={"token": "tokén-ünicode-💥"})
+        assert r.status_code == 401

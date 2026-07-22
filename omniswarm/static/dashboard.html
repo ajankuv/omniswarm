@@ -37,6 +37,16 @@
     .dlabel { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; padding-top:6px; }
     .dbox { background:#111; border:1px solid var(--line); border-radius:6px; padding:8px 10px; white-space:pre-wrap; word-break:break-word; font-size:13px; }
     .dbox.warn { color:var(--amber); border-color:var(--amber); }
+    .fb-btn { background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:6px; padding:4px 12px; margin-right:8px; cursor:pointer; font-size:13px; }
+    .fb-btn:hover { color:var(--fg); border-color:var(--fg); }
+    .fb-btn.up:hover { color:var(--green); border-color:var(--green); }
+    .fb-btn.down:hover { color:var(--red); border-color:var(--red); }
+    .cal-row { display:grid; grid-template-columns:70px 1fr 92px; gap:10px; align-items:center; margin:7px 0; font-size:12px; }
+    .cal-row .cap { text-transform:capitalize; }
+    .cal-row .track { height:8px; background:#1f1f1f; border-radius:4px; overflow:hidden; display:block; }
+    .cal-row .fill { height:100%; display:block; }
+    .cal-row .pct { text-align:right; color:var(--muted); }
+    .badge.cached { background:transparent; border:1px solid var(--accent); color:var(--accent); font-size:10px; padding:1px 6px; border-radius:4px; margin-left:6px; }
     .timeline { display:flex; flex-direction:column; gap:0; }
     .tstep { display:grid; grid-template-columns:130px 1fr; gap:12px; padding:8px 0; border-left:2px solid var(--line); padding-left:14px; margin-left:6px; position:relative; }
     .tstep::before { content:""; position:absolute; left:-6px; top:12px; width:10px; height:10px; border-radius:50%; background:var(--accent); }
@@ -142,10 +152,12 @@
 
   <section class="hero">
     <div class="stat"><div class="n" id="saved">—</div><div class="l">≈ Claude tokens saved</div></div>
+    <div class="stat"><div class="n" id="dollars">—</div><div class="l" id="dollars-l">≈ saved vs premium</div></div>
     <div class="stat"><div class="n" id="jobs">—</div><div class="l">jobs processed</div></div>
     <div class="stat"><div class="n" id="avg">—</div><div class="l">avg saved / job</div></div>
     <div class="stat"><div class="n" id="calls">—</div><div class="l">free model calls</div></div>
     <div class="stat"><div class="n" id="council">—</div><div class="l">council-escalated</div></div>
+    <div class="stat"><div class="n" id="cachehits">—</div><div class="l">verified-cache hits</div></div>
     <div class="stat"><div class="n sm" id="topmodel">—</div><div class="l">most-used model</div></div>
   </section>
 
@@ -153,6 +165,10 @@
     <div class="card"><h2>Free models at work</h2><div id="p-models"></div></div>
     <div class="card"><h2>Task types</h2><div id="p-tasks"></div></div>
     <div class="card"><h2>Confidence</h2><div id="p-conf"></div></div>
+    <div class="card">
+      <h2>Calibration <span class="muted" style="text-transform:none;letter-spacing:0;">— is the verdict trustworthy?</span></h2>
+      <div id="p-calibration"><div class="lf-empty">No rated jobs yet — 👍/👎 a job below to build the track-record.</div></div>
+    </div>
   </section>
 
   <section class="rel">
@@ -189,7 +205,8 @@
     const $ = (id) => document.getElementById(id);
     const OPEN = new Set();
     let JOBS = [];
-    const esc = (s) => (s == null ? "" : String(s)).replace(/[&<>]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;" }[c]));
+    // escapes quotes too: this output is interpolated into attributes, not just text
+    const esc = (s) => (s == null ? "" : String(s)).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
     const badge = (v) => `<span class="badge b-${(v||"none")}">${esc(v||"none")}</span>`;
     const ago = (t) => { const s=Math.max(0,Math.floor(Date.now()/1000-t));
       if(s<60)return s+"s ago"; if(s<3600)return Math.floor(s/60)+"m ago"; return Math.floor(s/3600)+"h ago"; };
@@ -213,6 +230,39 @@
             <td class="${s.http_429 ? "r429" : "muted"}">${s.http_429}</td>
           </tr>`;
         }).join("");
+      } catch (e) {}
+    }
+
+    async function loadCalibration() {
+      try {
+        const cal = await fetch(authedUrl("/calibration")).then((r) => r.json());
+        const el = $("p-calibration");
+        const order = ["high", "medium", "low", "none"];
+        const rows = order.filter((c) => cal.by_confidence && cal.by_confidence[c])
+          .map((c) => {
+            const b = cal.by_confidence[c];
+            const col = b.pct_correct >= 85 ? "var(--green)" : (b.pct_correct >= 60 ? "var(--amber)" : "var(--red)");
+            return `<div class="cal-row">
+              <span class="cap">${esc(c)}</span>
+              <span class="track"><span class="fill" style="width:${b.pct_correct}%;background:${col}"></span></span>
+              <span class="pct">${b.pct_correct}% <span class="muted">(${b.total})</span></span>
+            </div>`;
+          }).join("");
+        el.innerHTML = rows
+          ? rows + `<div class="muted" style="font-size:11px;margin-top:8px">overall ${cal.overall_pct}% correct across ${cal.total_rated} rated</div>`
+          : '<div class="lf-empty">No rated jobs yet — 👍/👎 a job below to build the track-record.</div>';
+      } catch (e) {}
+    }
+
+    async function sendFeedback(id, correct) {
+      try {
+        await fetch(authedUrl("/jobs/" + id + "/feedback"), {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ correct }),
+        });
+        const j = JOBS.find((x) => x.id === id);
+        if (j) j.feedback = correct ? "up" : "down";
+        renderRows(); loadCalibration();
       } catch (e) {}
     }
 
@@ -292,11 +342,16 @@
       let steps = [];
       try { steps = JSON.parse(j.provenance || "[]"); } catch (e) {}
       const note = j.note ? `<div class="dlabel">Note</div><div class="dbox warn">${esc(j.note)}</div>` : "";
+      const fbUI = j.feedback === "up" ? '<span style="color:var(--green)">👍 marked correct</span>'
+        : j.feedback === "down" ? '<span style="color:var(--red)">👎 marked wrong</span>'
+        : `<button class="fb-btn up" data-fb="${esc(j.id)}" data-fb-val="1">👍 correct</button>`
+          + `<button class="fb-btn down" data-fb="${esc(j.id)}" data-fb-val="0">👎 wrong</button>`;
       return `<div class="dwrap">
         <div class="dlabel">Input</div><div class="dbox">${esc(j.input) || '<span class="muted">—</span>'}</div>
         <div class="dlabel">Output</div><div class="dbox">${esc(j.result) || '<span class="muted">—</span>'}</div>
         <div class="dlabel">Provenance</div><div class="dbox">${timeline(steps)}</div>
         ${note}
+        <div class="dlabel">Was this right?</div><div class="dbox">${fbUI}</div>
       </div>`;
     }
 
@@ -305,15 +360,21 @@
       if (!JOBS.length) { rows.innerHTML = '<tr><td class="empty" colspan="7">No jobs yet. Send one to /v1/chat/completions.</td></tr>'; return; }
       rows.innerHTML = JOBS.map((j) => {
         const open = OPEN.has(j.id);
+        const cached = (j.note === "served from verified cache") ? '<span class="badge cached">cached</span>' : "";
         return `<tr class="jobrow${open ? " open" : ""}" data-id="${esc(j.id)}">
             <td class="mono muted">${esc(j.id)}</td><td>${esc(j.task_type)}</td>
-            <td>${badge(j.status)}</td><td>${badge(j.verdict)}</td><td>${badge(j.confidence)}</td>
+            <td>${badge(j.status)}</td><td>${badge(j.verdict)}${cached}</td><td>${badge(j.confidence)}</td>
             <td>${(j.tokens_saved||0).toLocaleString()}</td><td class="muted">${ago(j.created_at)}</td>
           </tr>
           <tr class="detail" data-detail="${esc(j.id)}" style="display:${open ? "table-row" : "none"}"><td colspan="7">${detailHtml(j)}</td></tr>`;
       }).join("");
       document.querySelectorAll("tr.jobrow").forEach((r) => r.addEventListener("click", () => {
         const id = r.dataset.id; if (OPEN.has(id)) OPEN.delete(id); else OPEN.add(id); renderRows();
+      }));
+      // listeners, not inline onclick — keeps job data out of an executable context
+      document.querySelectorAll("button.fb-btn").forEach((b) => b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        sendFeedback(b.dataset.fb, b.dataset.fbVal === "1");
       }));
     }
 
@@ -324,15 +385,19 @@
           fetch(authedUrl("/jobs?limit=50" + (filterQS() ? "&" + filterQS() : ""))).then((r) => r.json()),
         ]);
         $("saved").textContent = (stats.tokens_saved || 0).toLocaleString();
+        const usd = stats.dollars_saved || 0;
+        $("dollars").textContent = "$" + usd.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        if (stats.usd_per_mtok) $("dollars-l").textContent = "≈ saved vs premium @ $" + stats.usd_per_mtok + "/Mtok";
         $("jobs").textContent = stats.total_jobs || 0;
         $("avg").textContent = stats.avg_tokens_saved || 0;
         $("calls").textContent = stats.total_model_calls || 0;
         $("council").textContent = stats.council_engaged || 0;
+        $("cachehits").textContent = (stats.cache && stats.cache.hits) || 0;
         $("topmodel").textContent = stats.most_used_model || "—";
         $("p-models").innerHTML = bars(stats.by_model, "");
         $("p-tasks").innerHTML = bars(stats.by_task_type, "blue");
         $("p-conf").innerHTML = bars(stats.by_confidence, "amber");
-        JOBS = jobs; renderRows(); loadReliability();
+        JOBS = jobs; renderRows(); loadReliability(); loadCalibration();
         $("ts").textContent = "updated " + new Date().toLocaleTimeString();
       } catch (e) { $("ts").textContent = "connection error — retrying…"; }
     }

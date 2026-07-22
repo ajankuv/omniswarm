@@ -39,6 +39,8 @@ And the Model Picker recommends the best free model per slot — backed by your 
 - **Fire-and-forget job API** — submit a job and get an ID immediately; poll for the result, stream live updates via SSE, or export to JSON/CSV.
 - **Adaptive-tiered council** — deterministic validators (with an auto-fix attempt) → judge → role-based review board → synthesis. Escalates only when needed; every step is logged as a per-job provenance timeline.
 - **Automatic failover** — when a pinned model keeps failing at the gateway, every slot that uses it (task types, judge, council) swaps live to the top-ranked healthy alternative, persisted and reviewable in the Model Picker, with a dashboard banner. Free providers flake; your jobs keep flowing.
+- **Verdict calibration** — 👍/👎 any job (dashboard, API, or the MCP `omniswarm_feedback` tool) and OmniSwarm builds a track-record of whether its confidence is *earned*: *"when we say HIGH, we're right 94% of the time."* The confidence signal becomes measurable, not just asserted.
+- **Verified-answer cache** — a repeat of a prompt already QC'd to pass + high confidence returns the vetted answer instantly, at $0, with no council call. It caches *trust*, not just text; a 👎 evicts the entry so the cache stays honest.
 - **Task types** — `general · summarize · classify · draft · code · reasoning`, each with a pinned model and a QC rubric. `reasoning` always runs the full council.
 - **Live dashboard** (`GET /`) — tokens-saved hero stat, searchable/filterable job list with JSON/CSV export, per-job provenance timeline, model leaderboard, and real-time SSE updates.
 - **Control Panel** (`GET /control-panel`) — everything configurable live, no restart: API token, rate limit, privacy mode, council roster, scheduled jobs, Model Picker, Benchmark, and active config view.
@@ -182,6 +184,11 @@ Copy `omniswarm.toml.example` to `omniswarm.toml` (or set `OMNISWARM_CONFIG=/pat
 | `OMNISWARM_MAX_CONCURRENT_JOBS` | Concurrency cap |
 | `OMNISWARM_SCHED_INTERVAL` | Scheduler poll interval (seconds) |
 | `OMNISWARM_FAILOVER_THRESHOLD` | Consecutive failed gateway calls before auto-failover (default `6` ≈ two failed requests; `0` disables) |
+| `OMNISWARM_CACHE` | Verified-answer cache on/off (default `1`) |
+| `OMNISWARM_CACHE_TTL` | Seconds a cached answer stays fresh (default `604800` = 7 days; `0` = never expire) |
+| `OMNISWARM_CACHE_MIN_CONFIDENCE` | Minimum confidence to cache an answer: `high`/`medium`/`low` (default `high`) |
+| `OMNISWARM_CACHE_MAX_ENTRIES` | Hard cap on cached answers; least-used are evicted past it (default `5000`, `0` disables) |
+| `OMNISWARM_SAVINGS_USD_PER_MTOK` | Blended $/1M tokens of the premium model you'd otherwise pay for; drives the dashboard "$ saved" stat (default `5`) |
 | `OMNISWARM_REMOTE` | MCP observable mode — route through deployed app |
 | `OMNISWARM_REMOTE_TOKEN` | Token for the remote instance (MCP observable mode) |
 
@@ -196,6 +203,22 @@ Recommendations blend three signals: capability metadata from the gateway's `/mo
 ### Automatic failover
 
 Free-tier providers go down without warning. When any pinned model racks up consecutive gateway failures, OmniSwarm automatically swaps **every slot using it** — task types, judge, council chair, members — to the top-ranked healthy alternative (excluding anything currently failing, cooling down, or proven dead). The swap goes through the same persisted runtime-override path as the Model Picker, so it survives restarts and is visible and undoable in the Control Panel. A dismissible banner appears on the dashboard when it fires. There is no silent auto-restore: you switch back via the picker (or let a fresh benchmark make the case).
+
+### Verdict calibration — is the confidence earned?
+
+A confidence label is only useful if it's *true*. Give feedback on any finished job — 👍/👎 in the dashboard job detail, `POST /jobs/{id}/feedback` with `{"correct": true|false}`, or the MCP `omniswarm_feedback(job_id, correct)` tool (so an orchestrator like Claude can grade the answer it just consumed). OmniSwarm buckets every rated job by the confidence it *claimed at the time* and reports how often that was right:
+
+```
+GET /calibration
+→ { "by_confidence": { "high": {"correct": 293, "wrong": 19, "pct_correct": 93.9, ...}, ... },
+    "overall_pct": 88.5, "total_rated": 412 }
+```
+
+The dashboard renders this as a calibration curve. It turns *"trust me"* into *"here's my track record."*
+
+### Verified-answer cache
+
+Free providers are cheap but slow, and re-verifying an answer you've already vetted is wasted work. When a job passes at high confidence, OmniSwarm caches the result keyed by an exact-normalized (case/whitespace-insensitive) hash of the system + user prompt + task type. A repeat returns the **vetted** answer instantly — $0, no gateway call, no council — with the cache hit recorded in the job's provenance and a "cached" badge on the dashboard. It caches *trust*, not just text: only `pass` + `high` answers are stored, entries expire after a TTL, and a 👎 (see calibration above) evicts the entry so a bad answer can't keep being served. Disabled automatically under the `redact`/`none` privacy modes so cached text never outlives your privacy setting.
 
 ---
 
@@ -337,7 +360,6 @@ Both are surfaced in the live dashboard's model leaderboard section.
 - **Dollar-value savings** — translate tokens saved into "≈ $X vs premium-model pricing" on the dashboard.
 - **Job webhooks** — notify ntfy/Discord/anything on done / failed / escalated.
 - **A/B compare mode** — run one prompt across several models side-by-side and let the council judge the winner.
-- **Raw task type** — skip the council for trivial calls (frictionless drop-in proxy).
 - **Client-facing streaming** on `/v1/chat/completions`.
 - **OpenClaw integration** — ship the MCP toolset as an OpenClaw skill for $0 offload + verification in agent workflows.
 

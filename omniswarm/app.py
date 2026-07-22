@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,11 +35,35 @@ class ScheduleIn(BaseModel):
     interval_minutes: int = 60
 
 
+class FeedbackIn(BaseModel):
+    correct: bool
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = "omniswarm"
     messages: list[ChatMessage]
     max_tokens: int = 512
     omniswarm: OmniSwarmOptions = Field(default_factory=OmniSwarmOptions)
+
+
+_CSV_RISKY = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(v) -> str:
+    """Neutralize spreadsheet formula injection (CWE-1236) in exported cells.
+
+    Job input is user-supplied and results are LLM-generated, so a cell can start
+    with a formula trigger and execute when the export is opened in Excel/Sheets.
+    Checked after stripping leading whitespace, since importers trim it. Genuine
+    numbers are left alone so "-5" stays numeric rather than becoming text."""
+    s = "" if v is None else str(v)
+    if s.lstrip()[:1] not in _CSV_RISKY:
+        return s
+    try:
+        float(s)
+        return s          # a plain number, not a formula
+    except ValueError:
+        return "'" + s
 
 
 def _last(messages: list[ChatMessage], role: str, default: str = "") -> str:
@@ -111,7 +136,11 @@ def create_app() -> FastAPI:
         if header.startswith("Bearer "):
             supplied = header[7:]
         supplied = supplied or request.query_params.get("token")
-        if supplied != token:
+        # constant-time: a plain != leaks the matching prefix length via timing.
+        # compared as bytes — compare_digest raises TypeError on non-ASCII str,
+        # which would turn a junk header into a 500 instead of a clean 401.
+        if not secrets.compare_digest((supplied or "").encode("utf-8"),
+                                      token.encode("utf-8")):
             raise HTTPException(status_code=401, detail="invalid or missing API token")
 
     def _rate_limit(request: Request):
@@ -248,7 +277,7 @@ def create_app() -> FastAPI:
             w = csv.writer(buf)
             w.writerow(cols)
             for r in rows:
-                w.writerow([r.get(c, "") for c in cols])
+                w.writerow([_csv_safe(r.get(c, "")) for c in cols])
             return Response(content=buf.getvalue(), media_type="text/csv",
                             headers={"Content-Disposition": "attachment; filename=omniswarm-jobs.csv"})
         return JSONResponse(content=rows,
@@ -260,6 +289,18 @@ def create_app() -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="job not found")
         return row
+
+    @app.post("/jobs/{job_id}/feedback", dependencies=[Depends(_auth)])
+    async def feedback(job_id: str, body: FeedbackIn):
+        value = "up" if body.correct else "down"
+        ok = store.set_feedback(app.state.settings.db_path, job_id, value)
+        if not ok:
+            raise HTTPException(status_code=404, detail="job not found")
+        return {"ok": True, "feedback": value}
+
+    @app.get("/calibration", dependencies=[Depends(_auth)])
+    async def calibration():
+        return store.calibration(app.state.settings.db_path)
 
     @app.get("/healthz")
     async def healthz():
@@ -290,7 +331,10 @@ def create_app() -> FastAPI:
 
     @app.get("/stats", dependencies=[Depends(_auth)])
     async def stats():
-        return store.stats(app.state.settings.db_path)
+        s = store.stats(app.state.settings.db_path,
+                        app.state.settings.savings_usd_per_mtok)
+        s["cache"] = store.cache_stats(app.state.settings.db_path)
+        return s
 
     @app.get("/reliability", dependencies=[Depends(_auth)])
     async def reliability():
@@ -324,6 +368,10 @@ def create_app() -> FastAPI:
             rt["rate_limit_per_min"] = max(0, body["rate_limit_per_min"])
         if body.get("store_mode") in ("full", "redact", "none"):
             rt["store_mode"] = body["store_mode"]
+            # Cached answers hold plaintext that only "full" mode permits. Tightening
+            # the privacy mode must not leave it readable — or servable — afterwards.
+            if rt["store_mode"] != "full":
+                store.cache_clear(app.state.settings.db_path)
         if isinstance(body.get("active_roster"), list):
             valid = {m["role"] for m in registry.COUNCIL_MEMBERS}
             rt["active_roster"] = [r for r in body["active_roster"] if r in valid]

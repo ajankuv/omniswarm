@@ -283,3 +283,12 @@ def test_cache_put_self_prunes_to_cap(db_path):
         store.cache_put(db_path, f"k{i}", "general", "x", "pass", "high", '["m"]',
                         ttl_seconds=0, max_entries=3)
     assert store.cache_stats(db_path)["entries"] == 3     # never grows past the cap
+
+
+def test_list_jobs_tolerates_bad_limit(db_path):
+    store.create_job(db_path, "j1", "general", "done")
+    # non-int limits used to crash SQLite with a datatype mismatch
+    for bad in ("abc", 1.7, None, -1):
+        rows = store.list_jobs(db_path, limit=bad)   # must not raise
+        assert isinstance(rows, list)
+    assert len(store.list_jobs(db_path, limit=0)) == 0

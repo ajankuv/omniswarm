@@ -275,3 +275,118 @@ async def test_council_reads_judge_model_live(monkeypatch):
         assert "test/live-judge" in r.models_used
     finally:
         registry.apply_runtime({})
+
+
+@pytest.mark.asyncio
+async def test_council_escalates_on_revise_majority(monkeypatch):
+    # The "Build me a game" bug: every reviewer says the draft needs work, but the
+    # old logic only escalated on a hard reject, so it returned pass+medium.
+    async def fake_generate(client, base_url, model, system, user, max_tokens=512, max_retries=2):
+        if "council chair" in system.lower():
+            return '{"answer": "I will build it, let me start...", "disagreement": ""}'
+        return '{"verdict": "revise", "issues": "no deliverable, lacks implementation"}'
+    monkeypatch.setattr(council, "generate", fake_generate)
+    members = [{"role": "Code Auditor", "model": "a/ca", "focus": "code"},
+               {"role": "User Advocate", "model": "b/ua", "focus": "intent"},
+               {"role": "Security Engineer", "model": "c/se", "focus": "sec"}]
+    r = await council.run_council(None, "http://x/v1", members, "c/synth", "build me a game", "draft")
+    assert r.verdict == "escalated"           # unanimous revise must NOT be a pass
+    assert "all 3 reviewers wanted changes" in r.note
+
+
+@pytest.mark.asyncio
+async def test_council_escalates_when_judge_scored_low(monkeypatch):
+    # A poor Tier-1 judge score must not be discarded once the council runs.
+    async def fake_generate(client, base_url, model, system, user, max_tokens=512, max_retries=2):
+        if "council chair" in system.lower():
+            return '{"answer": "ok", "disagreement": ""}'
+        return '{"verdict": "approve", "issues": ""}'   # council approves...
+    monkeypatch.setattr(council, "generate", fake_generate)
+    members = [{"role": "Dev", "model": "a/d", "focus": "x"}]
+    # ...but the judge already scored it 0.2
+    r = await council.run_council(None, "http://x/v1", members, "c/synth", "t", "draft", judge_score=0.2)
+    assert r.verdict == "escalated"
+    assert "0.2" in r.note
+
+
+@pytest.mark.asyncio
+async def test_council_still_passes_single_revise_among_approvals(monkeypatch):
+    # Guard against over-correction: one dissenting "revise" among approvals stays pass.
+    async def fake_generate(client, base_url, model, system, user, max_tokens=512, max_retries=2):
+        if "council chair" in system.lower():
+            return '{"answer": "ok", "disagreement": ""}'
+        if model == "a/x":
+            return '{"verdict": "revise", "issues": "nit"}'
+        return '{"verdict": "approve", "issues": ""}'
+    monkeypatch.setattr(council, "generate", fake_generate)
+    members = [{"role": "A", "model": "a/x", "focus": ""},
+               {"role": "B", "model": "b/y", "focus": ""},
+               {"role": "C", "model": "c/z", "focus": ""}]
+    r = await council.run_council(None, "http://x/v1", members, "c/synth", "t", "draft", judge_score=0.9)
+    assert r.verdict == "pass" and r.confidence == "medium"
+
+
+@pytest.mark.asyncio
+async def test_judge_parse_failure_does_not_escalate_approved_answer(monkeypatch):
+    # Regression from live stress test: the judge's JSON failed to parse (score None,
+    # NOT 0.0). The council unanimously APPROVED. That must PASS, not escalate —
+    # a missing judge signal is not a low score.
+    async def fake_generate(client, base_url, model, system, user, max_tokens=512, max_retries=2):
+        if "council chair" in system.lower():
+            return '{"answer": "ok", "disagreement": ""}'
+        return '{"verdict": "approve", "issues": ""}'
+    monkeypatch.setattr(council, "generate", fake_generate)
+    members = [{"role": "A", "model": "a/x", "focus": ""},
+               {"role": "B", "model": "b/y", "focus": ""},
+               {"role": "C", "model": "c/z", "focus": ""}]
+    r = await council.run_council(None, "http://x/v1", members, "c/synth", "t", "draft", judge_score=None)
+    assert r.verdict == "pass"          # unanimous approve + no judge signal -> pass
+    assert r.confidence == "high"
+
+
+@pytest.mark.asyncio
+async def test_judge_returns_none_score_on_parse_failure(monkeypatch):
+    async def fake_generate(*a, **k):
+        return "the judge model rambled with no JSON at all"
+    monkeypatch.setattr(council, "generate", fake_generate)
+    jr = await council.judge(None, "http://x/v1", "m", "rubric", "task", "answer")
+    assert jr.score is None and jr.action == "unsure"
+
+
+@pytest.mark.asyncio
+async def test_member_parse_failure_abstains_not_revise(monkeypatch):
+    # Two reviewers' JSON is garbage; one approves. Parse failures must ABSTAIN,
+    # not count as "revise" — otherwise noise forces a false escalation.
+    async def fake_generate(client, base_url, model, system, user, max_tokens=512, max_retries=2):
+        if "council chair" in system.lower():
+            return '{"answer": "ok", "disagreement": ""}'
+        if model == "good/m":
+            return '{"verdict": "approve", "issues": ""}'
+        return 'the model rambled, no json here'          # parse failure
+    monkeypatch.setattr(council, "generate", fake_generate)
+    members = [{"role": "A", "model": "good/m", "focus": ""},
+               {"role": "B", "model": "bad/1", "focus": ""},
+               {"role": "C", "model": "bad/2", "focus": ""}]
+    r = await council.run_council(None, "http://x/v1", members, "c/synth", "t", "draft", judge_score=0.9)
+    # only one real vote (approve) -> not a change-majority -> pass
+    assert r.verdict == "pass"
+    stages = [s for s in r.steps if s["stage"] == "review"]
+    assert len(stages) == 1                                # abstainers cast no review
+
+
+@pytest.mark.asyncio
+async def test_council_passes_split_vote_with_medium_confidence(monkeypatch):
+    # 2 revise, 1 approve — a split, NOT unanimous. Must PASS (medium), so ordinary
+    # nitpicks don't escalate every legitimate answer back to the caller.
+    async def fake_generate(client, base_url, model, system, user, max_tokens=512, max_retries=2):
+        if "council chair" in system.lower():
+            return '{"answer": "ok", "disagreement": ""}'
+        if model == "c/ok":
+            return '{"verdict": "approve", "issues": ""}'
+        return '{"verdict": "revise", "issues": "could be tighter"}'
+    monkeypatch.setattr(council, "generate", fake_generate)
+    members = [{"role": "A", "model": "a/x", "focus": ""},
+               {"role": "B", "model": "b/y", "focus": ""},
+               {"role": "C", "model": "c/ok", "focus": ""}]
+    r = await council.run_council(None, "http://x/v1", members, "c/synth", "t", "draft", judge_score=0.9)
+    assert r.verdict == "pass" and r.confidence == "medium"

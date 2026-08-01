@@ -566,3 +566,26 @@ def test_auth_rejects_non_ascii_token_without_500(monkeypatch, tmp_path):
         c.post("/settings", json={"api_token": "sk-secret"})
         r = c.get("/jobs", params={"token": "tokén-ünicode-💥"})
         assert r.status_code == 401
+
+
+def test_settings_models_merge_not_wipe(monkeypatch, tmp_path):
+    """A partial or invalid models POST must not wipe existing overrides (#7)."""
+    import omniswarm.app as app_module
+    from omniswarm import catalog
+    monkeypatch.setenv("OMNISWARM_DB_PATH", str(tmp_path / "d.db"))
+    monkeypatch.setenv("OMNISWARM_RUNTIME", str(tmp_path / "rt.json"))
+    from fastapi.testclient import TestClient
+    async def fake_catalog(app):
+        return [{"id": "prov/model-a"}, {"id": "prov/model-b"}, {"id": "prov/model-c"}]
+    monkeypatch.setattr(catalog, "get_cached_catalog", fake_catalog)
+    with TestClient(app_module.create_app()) as c:
+        c.post("/settings", json={"models": {"general": "prov/model-a", "code": "prov/model-b"}})
+        # a partial update for a different slot must keep general+code
+        c.post("/settings", json={"models": {"summarize": "prov/model-c"}})
+        m = c.get("/settings").json()["models"]
+        assert m["general"] == "prov/model-a" and m["code"] == "prov/model-b"
+        assert m["summarize"] == "prov/model-c"
+        # an all-invalid dict must not wipe anything
+        c.post("/settings", json={"models": {"general": "../../etc/passwd"}})
+        m2 = c.get("/settings").json()["models"]
+        assert m2["general"] == "prov/model-a"   # unchanged, not wiped

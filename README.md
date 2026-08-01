@@ -188,6 +188,7 @@ Copy `omniswarm.toml.example` to `omniswarm.toml` (or set `OMNISWARM_CONFIG=/pat
 | `OMNISWARM_CACHE_TTL` | Seconds a cached answer stays fresh (default `604800` = 7 days; `0` = never expire) |
 | `OMNISWARM_CACHE_MIN_CONFIDENCE` | Minimum confidence to cache an answer: `high`/`medium`/`low` (default `high`) |
 | `OMNISWARM_CACHE_MAX_ENTRIES` | Hard cap on cached answers; least-used are evicted past it (default `5000`, `0` disables) |
+| `OMNISWARM_SAFETY_SCREEN` | Escalate clearly-harmful requests (malware, phishing, weapons, fraud) without generating them (default `1`; `0` to disable, e.g. for security research) |
 | `OMNISWARM_SAVINGS_USD_PER_MTOK` | Blended $/1M tokens of the premium model you'd otherwise pay for; drives the dashboard "$ saved" stat (default `5`) |
 | `OMNISWARM_REMOTE` | MCP observable mode — route through deployed app |
 | `OMNISWARM_REMOTE_TOKEN` | Token for the remote instance (MCP observable mode) |

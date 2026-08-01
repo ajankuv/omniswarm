@@ -386,7 +386,14 @@ def create_app() -> FastAPI:
         # otherwise an unavailable gateway would silently wipe the model map to defaults.
         if cat_ids:
             if isinstance(body.get("models"), dict):
-                rt["models"] = {str(k): v for k, v in body["models"].items() if _valid(v)}
+                # MERGE validated entries into the existing overrides — don't replace.
+                # A replace meant a partial update dropped other slots, and an
+                # all-invalid dict wiped every override to {} (silent config loss).
+                merged = dict(rt.get("models") or {})
+                for k, v in body["models"].items():
+                    if _valid(v):
+                        merged[str(k)] = v
+                rt["models"] = merged
             if _valid(body.get("judge")):
                 rt["judge"] = body["judge"]
             if _valid(body.get("synth")):

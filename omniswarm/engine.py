@@ -2,7 +2,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 
-from omniswarm import events, store
+from omniswarm import events, safety, store
 from omniswarm.adapters import generate, OmniRouteError
 from omniswarm.council import review
 from omniswarm.registry import get_task_type
@@ -42,6 +42,24 @@ async def process_job(client, settings, req: JobRequest, store_mode: str = "full
                             input=_mask(req.user, store_mode), cache_key=key)
     base = settings.omniroute_base_url
 
+    # Safety screen (bug #3): a clearly-harmful request must not be judged on quality
+    # alone and pass — it escalates for human review, and we do NOT generate the
+    # content in the first place.
+    flagged = safety.screen_request(req.user)
+    if flagged:
+        note = f"flagged for safety review: {flagged}"
+        events.publish({"type": "step", "job_id": job_id, "stage": "safety", "detail": note})
+        await asyncio.to_thread(
+            store.update_job, settings.db_path, job_id,
+            status="escalated", verdict="escalated", confidence="low",
+            result="[withheld: request flagged for safety review — not processed]",
+            tokens_saved=0, note=note, models_used="[]", provenance="[]",
+        )
+        events.publish({"type": "job", "job_id": job_id, "status": "escalated",
+                        "verdict": "escalated", "task_type": task.name})
+        return {"job_id": job_id, "text": "", "verdict": "escalated", "confidence": "low",
+                "models_used": [], "tokens_saved": 0, "status": "escalated", "flagged": flagged}
+
     # Feature B — verified-answer cache: a repeat of a prompt we already QC'd to
     # pass+high returns the vetted answer instantly, $0, no council call.
     if getattr(settings, "cache_enabled", False):
@@ -75,6 +93,13 @@ async def process_job(client, settings, req: JobRequest, store_mode: str = "full
             store.add_event, settings.db_path, job_id, "generate", task.model, candidate
         )
         rr = await review(client, base, task, req.system, req.user, candidate, active_roster=active_roster, always_council=always_council, on_step=lambda s: events.publish({"type": "step", "job_id": job_id, **s}))
+        # Prompt-exfiltration guard (bug #4): if the answer echoed our own internal
+        # judge/council system prompts, withhold it and escalate rather than hand
+        # the leaked instructions back to the caller.
+        if safety.reveals_internal_prompt(rr.text):
+            rr.text = "[withheld: response echoed internal instructions]"
+            rr.verdict, rr.confidence = "escalated", "low"
+            rr.note = "withheld: prompt-exfiltration attempt"
         status = "done" if rr.verdict == "pass" else "escalated"
         saved = estimate_tokens(req.user) + estimate_tokens(rr.text)
         await asyncio.to_thread(

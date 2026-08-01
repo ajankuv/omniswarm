@@ -148,6 +148,13 @@ def get_job(path: str, job_id: str) -> dict | None:
 def list_jobs(path: str, limit: int = 50, status: str | None = None,
               verdict: str | None = None, task_type: str | None = None,
               q: str | None = None) -> list[dict]:
+    # coerce+clamp: a non-int limit crashes SQLite (datatype mismatch), and a
+    # negative limit means "unbounded" in SQLite, which could return the whole table.
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(0, min(limit, 10000))
     clauses: list[str] = []
     params: list = []
     if status:

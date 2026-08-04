@@ -589,3 +589,22 @@ def test_settings_models_merge_not_wipe(monkeypatch, tmp_path):
         c.post("/settings", json={"models": {"general": "../../etc/passwd"}})
         m2 = c.get("/settings").json()["models"]
         assert m2["general"] == "prov/model-a"   # unchanged, not wiped
+
+
+def test_stats_exposes_provider_breaker(client):
+    s = client.get("/stats").json()
+    assert "providers" in s and "exhausted_providers" in s
+    assert isinstance(s["exhausted_providers"], list)
+
+
+def test_provider_breaker_wired_into_app(client):
+    assert client.app.state.provider_breaker is not None
+    from omniswarm import adapters
+    assert adapters._SINK is not None      # sink feeds the breaker
+
+
+def test_dashboard_has_provider_banner(client):
+    html = client.get("/").text
+    assert 'id="provider-banner"' in html
+    assert "renderProviderBanner" in html
+    assert "exhausted_providers" in html

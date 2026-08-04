@@ -97,10 +97,12 @@ def create_app() -> FastAPI:
         from omniswarm import adapters as _adapters
         _db = settings.db_path
         app.state.failover = failover.FailoverTracker()
+        app.state.provider_breaker = failover.ProviderBreaker()
         app.state.settings_lock = asyncio.Lock()
 
         def _sink(model, ok, lat, status):
             store.record_model_call(_db, model, ok, lat, status)
+            app.state.provider_breaker.record(model, ok, status)   # T1.2 provider circuit breaker
             if app.state.failover.record(model, ok):
                 # sink runs inside the event loop (called from async generate)
                 task = asyncio.get_running_loop().create_task(failover.execute(app, model))
@@ -334,6 +336,10 @@ def create_app() -> FastAPI:
         s = store.stats(app.state.settings.db_path,
                         app.state.settings.savings_usd_per_mtok)
         s["cache"] = store.cache_stats(app.state.settings.db_path)
+        # T1.2/T1.4 — provider breaker state for dashboard visibility + alerts
+        br = getattr(app.state, "provider_breaker", None)
+        s["providers"] = br.state() if br is not None else {}
+        s["exhausted_providers"] = sorted(br.exhausted()) if br is not None else []
         return s
 
     @app.get("/reliability", dependencies=[Depends(_auth)])

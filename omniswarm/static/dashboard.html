@@ -95,6 +95,11 @@
       padding:10px 14px; font-size:13px; color:var(--amber); }
     #failover-banner.show { display:flex; }
     #failover-banner b { color:var(--fg); }
+    #provider-banner { display:none; align-items:center; gap:10px; margin:0 0 14px;
+      background:rgba(239,68,68,.09); border:1px solid var(--red); border-radius:10px;
+      padding:10px 14px; font-size:13px; color:var(--red); }
+    #provider-banner.show { display:flex; }
+    #provider-banner b { color:var(--fg); }
     #failover-banner .fo-close { margin-left:auto; background:transparent; border:1px solid var(--line);
       color:var(--muted); border-radius:6px; padding:2px 9px; cursor:pointer; font-size:12px; }
     #failover-banner .fo-close:hover { color:var(--fg); border-color:var(--amber); }
@@ -141,6 +146,7 @@
     </div>
   </section>
 
+  <div id="provider-banner"></div>
   <div id="failover-banner"></div>
 
   <section class="livewrap">
@@ -398,9 +404,23 @@
         $("p-tasks").innerHTML = bars(stats.by_task_type, "blue");
         $("p-conf").innerHTML = bars(stats.by_confidence, "amber");
         JOBS = jobs; renderRows(); loadReliability(); loadCalibration();
+        renderProviderBanner(stats);
         $("ts").textContent = "updated " + new Date().toLocaleTimeString();
       } catch (e) { $("ts").textContent = "connection error — retrying…"; }
     }
+
+    // T1.2/T1.4 — show a banner when a provider's circuit breaker has tripped
+    // (out of quota / auth), so it's visible here instead of found out by email.
+    function renderProviderBanner(stats) {
+      const el = $("provider-banner");
+      const ex = (stats && stats.exhausted_providers) || [];
+      if (!ex.length) { el.className = ""; el.innerHTML = ""; return; }
+      const list = ex.map((p) => `<b>${esc(p)}</b>`).join(", ");
+      el.innerHTML = `⛔ provider${ex.length > 1 ? "s" : ""} exhausted (quota/auth): ${list}`
+        + ` — routing skips ${ex.length > 1 ? "them" : "it"} until recovery.`;
+      el.className = "show";
+    }
+
     refresh();
     setInterval(refresh, 4000);
 

@@ -38,9 +38,11 @@ And the Model Picker recommends the best free model per slot — backed by your 
 - **OpenAI-compatible API** (`POST /v1/chat/completions`) — drop-in endpoint; runs the council and returns a standard OpenAI response plus an `omniswarm` block with verdict, confidence, and token savings.
 - **Fire-and-forget job API** — submit a job and get an ID immediately; poll for the result, stream live updates via SSE, or export to JSON/CSV.
 - **Adaptive-tiered council** — deterministic validators (with an auto-fix attempt) → judge → role-based review board → synthesis. Escalates only when needed; every step is logged as a per-job provenance timeline.
-- **Automatic failover** — when a pinned model keeps failing at the gateway, every slot that uses it (task types, judge, council) swaps live to the top-ranked healthy alternative, persisted and reviewable in the Model Picker, with a dashboard banner. Free providers flake; your jobs keep flowing.
+- **Automatic failover** — when a pinned model keeps failing at the gateway, every slot that uses it (task types, judge, council) swaps live to the top-ranked *proven-healthy* alternative, persisted and reviewable in the Model Picker, with a dashboard banner. Free providers flake; your jobs keep flowing.
+- **Provider circuit breaker** — when a whole provider runs out of credits or gets rate-limited, OmniSwarm trips a breaker and stops routing to it (fail-fast, no wasted retries), reading the gateway's *explicit* exhaustion signal so it reacts on the first "out of credits" response. The exhausted provider shows on the dashboard — so you *see* it instead of finding out from an email.
 - **Verdict calibration** — 👍/👎 any job (dashboard, API, or the MCP `omniswarm_feedback` tool) and OmniSwarm builds a track-record of whether its confidence is *earned*: *"when we say HIGH, we're right 94% of the time."* The confidence signal becomes measurable, not just asserted.
 - **Verified-answer cache** — a repeat of a prompt already QC'd to pass + high confidence returns the vetted answer instantly, at $0, with no council call. It caches *trust*, not just text; a 👎 evicts the entry so the cache stays honest.
+- **Dollar-value savings** — the dashboard hero translates tokens saved into "≈ $X saved vs premium pricing" (configurable blended rate via `OMNISWARM_SAVINGS_USD_PER_MTOK`).
 - **Task types** — `general · summarize · classify · draft · code · reasoning`, each with a pinned model and a QC rubric. `reasoning` always runs the full council.
 - **Live dashboard** (`GET /`) — tokens-saved hero stat, searchable/filterable job list with JSON/CSV export, per-job provenance timeline, model leaderboard, and real-time SSE updates.
 - **Control Panel** (`GET /control-panel`) — everything configurable live, no restart: API token, rate limit, privacy mode, council roster, scheduled jobs, Model Picker, Benchmark, and active config view.
@@ -184,6 +186,8 @@ Copy `omniswarm.toml.example` to `omniswarm.toml` (or set `OMNISWARM_CONFIG=/pat
 | `OMNISWARM_MAX_CONCURRENT_JOBS` | Concurrency cap |
 | `OMNISWARM_SCHED_INTERVAL` | Scheduler poll interval (seconds) |
 | `OMNISWARM_FAILOVER_THRESHOLD` | Consecutive failed gateway calls before auto-failover (default `6` ≈ two failed requests; `0` disables) |
+| `OMNISWARM_PROVIDER_BREAKER_THRESHOLD` | Quota/auth (403/410/429…) errors from a provider before its circuit breaker trips and routing skips it (default `4`; `0` disables) |
+| `OMNISWARM_PROVIDER_BREAKER_COOLDOWN` | Seconds an exhausted provider stays circuit-broken before it's retried (default `1800`) |
 | `OMNISWARM_CACHE` | Verified-answer cache on/off (default `1`) |
 | `OMNISWARM_CACHE_TTL` | Seconds a cached answer stays fresh (default `604800` = 7 days; `0` = never expire) |
 | `OMNISWARM_CACHE_MIN_CONFIDENCE` | Minimum confidence to cache an answer: `high`/`medium`/`low` (default `high`) |
@@ -203,7 +207,19 @@ Recommendations blend three signals: capability metadata from the gateway's `/mo
 
 ### Automatic failover
 
-Free-tier providers go down without warning. When any pinned model racks up consecutive gateway failures, OmniSwarm automatically swaps **every slot using it** — task types, judge, council chair, members — to the top-ranked healthy alternative (excluding anything currently failing, cooling down, or proven dead). The swap goes through the same persisted runtime-override path as the Model Picker, so it survives restarts and is visible and undoable in the Control Panel. A dismissible banner appears on the dashboard when it fires. There is no silent auto-restore: you switch back via the picker (or let a fresh benchmark make the case).
+Free-tier providers go down without warning. When any pinned model racks up consecutive gateway failures, OmniSwarm automatically swaps **every slot using it** — task types, judge, council chair, members — to the top-ranked **proven-healthy** alternative (a model with a real success track record — it won't fail over onto a shiny but untested model that turns out to be dead). The swap goes through the same persisted runtime-override path as the Model Picker, so it survives restarts and is visible and undoable in the Control Panel. A dismissible banner appears on the dashboard when it fires. There is no silent auto-restore: you switch back via the picker (or let a fresh benchmark make the case).
+
+### Provider circuit breaker (free-tier resilience)
+
+Free tiers run out. When you're offloading real volume across pooled providers, one will hit its quota or rate limit — and without guardrails a system will happily keep hammering a dead provider, retrying errors that can never succeed, and failing silently. OmniSwarm handles this the way a resilient system should:
+
+- **Fail fast.** Quota/auth/gone errors (`403/410/404/429`) are *not* retried — retrying can't help, it just wastes time and load. Only genuinely transient errors (`5xx`, timeouts) retry.
+- **Trip a breaker for the whole provider.** When a provider returns exhaustion errors, OmniSwarm stops routing to *all* of its models at once — instead of rediscovering each one dead, model by model.
+- **React on the *explicit* signal.** The gateway doesn't just return a status code — it returns a structured reason (e.g. `{"error":{"message":"No active credentials for provider: X"}}` or `rate_limit_exceeded`). OmniSwarm reads that, so a single definitive "out of credits" response trips the breaker **immediately**; ambiguous bare status codes still accrue to a threshold first.
+- **Recover automatically.** A tripped provider is retried after a cooldown, and any successful call clears it — so when the free tier resets, routing flows back on its own.
+- **Show it.** Exhausted providers surface in `GET /stats` (`exhausted_providers`) and as a banner on the dashboard — you *see* the problem instead of learning it from a provider email.
+
+Tune with `OMNISWARM_PROVIDER_BREAKER_THRESHOLD` (errors before an ambiguous provider trips; default `4`, `0` disables the breaker) and `OMNISWARM_PROVIDER_BREAKER_COOLDOWN` (seconds before a tripped provider is retried; default `1800`).
 
 ### Verdict calibration — is the confidence earned?
 
@@ -358,7 +374,6 @@ Both are surfaced in the live dashboard's model leaderboard section.
 ## Roadmap — coming soon
 
 - **Multi-gateway support** — register several OpenAI-compatible gateways at once (OmniRoute + Ollama + OpenRouter free tier) with per-gateway model namespaces.
-- **Dollar-value savings** — translate tokens saved into "≈ $X vs premium-model pricing" on the dashboard.
 - **Job webhooks** — notify ntfy/Discord/anything on done / failed / escalated.
 - **A/B compare mode** — run one prompt across several models side-by-side and let the council judge the winner.
 - **Client-facing streaming** on `/v1/chat/completions`.

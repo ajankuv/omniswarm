@@ -27,6 +27,49 @@ class OmniRouteError(Exception):
     pass
 
 
+# HTTP codes where retrying is pointless: the provider is out of quota, the key is
+# rejected, or the model is gone. Retrying just wastes time and hammers a dead
+# provider (this is what turned a quota-burn into a 54%-failure cascade). Everything
+# else (5xx, timeouts, empty responses) is treated as transient and retried.
+_PERMANENT_HTTP = frozenset({401, 402, 403, 404, 405, 410, 429})
+
+
+def _is_permanent(status: str) -> bool:
+    """True for a status string like 'HTTP 403' whose code is non-retryable."""
+    if status.startswith("HTTP "):
+        code = status[5:].split()[0] if status[5:] else ""
+        try:
+            return int(code) in _PERMANENT_HTTP
+        except ValueError:
+            return False
+    return False
+
+
+# Explicit provider-exhaustion signals the gateway puts in the error body — these are
+# DEFINITIVE (the provider is out of credits / rate-limited), unlike a bare status code.
+_EXHAUSTION_MARKERS = (
+    "no active credentials",       # OmniRoute: provider has no working key/credits
+    "insufficient_quota",
+    "rate_limit_exceeded",
+    "rate_limit_error",
+    "quota exceeded",
+    "out of credits",
+)
+
+
+def _is_exhaustion_body(text: str) -> bool:
+    """True if the gateway's error body explicitly says the provider is exhausted."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(mk in low for mk in _EXHAUSTION_MARKERS)
+
+
+def is_exhaustion(status: str) -> bool:
+    """The breaker's fast-trip signal: an explicit provider-exhaustion response."""
+    return "EXHAUSTED" in status
+
+
 def _is_reasoning(model: str) -> bool:
     return model.startswith(_REASONING_PREFIXES)
 
@@ -96,7 +139,14 @@ async def generate(
         try:
             resp = await client.post(url, json=body, headers=headers)
             if resp.status_code != 200:
-                status = f"HTTP {resp.status_code}"; last_err = status
+                status = f"HTTP {resp.status_code}"
+                # the gateway tells us WHY in a structured error body — surface an
+                # explicit provider-exhaustion signal so the breaker can trip on it
+                # immediately (one "no active credentials" is definitive) instead of
+                # counting blind HTTP codes.
+                if _is_exhaustion_body(resp.text):
+                    status += " EXHAUSTED"
+                last_err = status
             else:
                 if body["stream"]:
                     out = _parse_stream(resp.text)
@@ -112,6 +162,9 @@ async def generate(
         _emit(model, ok, (time.perf_counter() - t0) * 1000.0, status)
         if ok:
             return out
+        # fail fast on quota/auth/gone — retrying can't help and only burns a dead provider
+        if _is_permanent(status):
+            raise OmniRouteError(f"{model} failed ({status}) — not retrying (permanent/quota)")
         if attempt < max_retries:
             await asyncio.sleep((2 ** attempt) * 0.5 + random.uniform(0, 0.3))
     raise OmniRouteError(f"{model} failed after {max_retries + 1} attempts: {last_err}")

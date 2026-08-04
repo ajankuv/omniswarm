@@ -13,11 +13,79 @@ import os
 import time
 
 from omniswarm import recommend
+from omniswarm.adapters import _is_permanent, is_exhaustion
 
 log = logging.getLogger("omniswarm.failover")
 
 DEFAULT_THRESHOLD = 6      # per-attempt sink records; ≈2 failed requests
 COOLDOWN_SECONDS = 600.0   # a tripped model is not eligible as a replacement for this long
+
+# T1.2 — provider circuit breaker
+PROVIDER_FAIL_THRESHOLD = int(os.environ.get("OMNISWARM_PROVIDER_BREAKER_THRESHOLD", "4"))
+PROVIDER_COOLDOWN = float(os.environ.get("OMNISWARM_PROVIDER_BREAKER_COOLDOWN", str(30 * 60)))
+
+
+def _provider_of(model: str) -> str:
+    return model.split("/", 1)[0]
+
+
+class ProviderBreaker:
+    """Trips a breaker for a whole PROVIDER when its models keep returning quota/auth/
+    gone errors (403/410/404/429), so routing stops hammering an exhausted provider
+    instead of rediscovering it dead model-by-model. Feeds the failover exclude set
+    and the dashboard. Counters are per-provider, in-memory (single-worker)."""
+
+    def __init__(self, threshold: int | None = None, cooldown: float | None = None):
+        self.threshold = PROVIDER_FAIL_THRESHOLD if threshold is None else threshold
+        self.cooldown = PROVIDER_COOLDOWN if cooldown is None else cooldown
+        self._perm_fails: dict[str, int] = {}       # consecutive quota/auth fails
+        self._last_fail_at: dict[str, float] = {}   # when the last one landed
+
+    def record(self, model: str, ok: bool, status: str) -> None:
+        if self.threshold <= 0:
+            return
+        p = _provider_of(model)
+        if ok:
+            self._perm_fails[p] = 0                  # a success clears the provider
+            return
+        # only quota/auth/gone counts toward tripping a provider (transient 5xx doesn't)
+        if _is_permanent(status):
+            now = time.time()
+            was_exhausted = self._is_exhausted(p, now)
+            # an EXPLICIT exhaustion signal from the gateway ("no active credentials",
+            # rate_limit…) is definitive — jump straight to the threshold and trip now,
+            # don't wait to count blind HTTP codes. Ambiguous codes still accrue.
+            bumped = self._perm_fails.get(p, 0) + 1
+            self._perm_fails[p] = max(bumped, self.threshold) if is_exhaustion(status) else bumped
+            self._last_fail_at[p] = now
+            if not was_exhausted and self._is_exhausted(p, now):
+                log.warning("provider breaker TRIPPED: %s exhausted (%s)", p,
+                            "explicit signal" if is_exhaustion(status) else f"{self._perm_fails[p]} errors")
+
+    def _is_exhausted(self, p: str, now: float) -> bool:
+        # exhausted while it has >= threshold recent permanent fails. If it stops
+        # failing for `cooldown` (or a call succeeds → count reset), it clears — and
+        # it can trip AGAIN later, unlike a one-shot latch.
+        return (self._perm_fails.get(p, 0) >= self.threshold
+                and (now - self._last_fail_at.get(p, 0)) < self.cooldown)
+
+    def exhausted(self) -> set[str]:
+        now = time.time()
+        return {p for p in self._perm_fails if self._is_exhausted(p, now)}
+
+    def exhausted_models(self, catalog: list[dict]) -> set[str]:
+        ex = self.exhausted()
+        return {m["id"] for m in catalog if _provider_of(m["id"]) in ex}
+
+    def state(self) -> dict:
+        now = time.time()
+        out = {}
+        for p in self._perm_fails:
+            last = self._last_fail_at.get(p)
+            out[p] = {"exhausted": self._is_exhausted(p, now),
+                      "perm_fails": self._perm_fails.get(p, 0),
+                      "since_s": int(now - last) if last else None}
+        return out
 
 
 class FailoverTracker:
@@ -76,14 +144,28 @@ def affected_slots(model: str) -> dict:
     }
 
 
+def _proven_healthy(cid: str, reliability: dict) -> bool:
+    """A model with real, mostly-successful recent history — safe to fail over TO."""
+    r = reliability.get(cid)
+    return bool(r and r.get("calls", 0) >= 3 and r.get("success_pct", 0.0) >= 70.0)
+
+
 def choose_replacement(slot: str, catalog: list[dict], reliability: dict,
                        quality: dict, exclude: set[str]) -> str | None:
-    """Top-ranked candidate for `slot` that isn't excluded (failing/cooling-down/dead)."""
+    """Pick a replacement for `slot`, excluding failing/cooling-down/dead models.
+
+    Auto-failover must land on something KNOWN-GOOD. The recommender ranks a shiny
+    zero-history model on capability alone (empirical is neutral, `_is_dead` needs
+    3+ calls @0%), so it would happily swap to a brand-new model that's actually
+    dead — exactly the quota-burn cascade (gpt-5-mini/o3-mini → 404). So we prefer
+    the best-ranked PROVEN-healthy candidate first, and only fall back to the raw
+    capability ranking when nothing has a track record yet."""
     ranked = recommend.recommend(slot, catalog, reliability, quality)["ranked"]
-    for cand in ranked:
-        if cand["id"] not in exclude:
-            return cand["id"]
-    return None
+    candidates = [c for c in ranked if c["id"] not in exclude]
+    for c in candidates:
+        if _proven_healthy(c["id"], reliability):
+            return c["id"]
+    return candidates[0]["id"] if candidates else None
 
 
 async def execute(app, model: str) -> dict | None:
@@ -100,7 +182,12 @@ async def execute(app, model: str) -> dict | None:
             return None
         rel = _store.model_reliability(app.state.settings.db_path)
         quality = _store.latest_benchmarks(app.state.settings.db_path)
+        # exclude failing/cooling-down models AND every model of an exhausted provider
+        # (breaker), so we never swap onto a provider that's out of quota.
         exclude = {model} | tracker.unhealthy()
+        breaker = getattr(app.state, "provider_breaker", None)
+        if breaker is not None:
+            exclude |= breaker.exhausted_models(cat)
         swaps: dict[str, str] = {}
         async with app.state.settings_lock:
             rt = dict(app.state.runtime)

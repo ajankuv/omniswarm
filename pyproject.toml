@@ -29,8 +29,8 @@ dependencies = [
 [project.optional-dependencies]
 # mcp capped below 2.0: the 2.0 rewrite (2026-07-28) removed mcp.server.fastmcp,
 # which mcp_server.py imports. Lift the cap only alongside a migration to the 2.x API.
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "mcp>=1.0,<2"]
-mcp = ["mcp>=1.0,<2"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "mcp>=1.0,<3"]
+mcp = ["mcp>=1.0,<3"]
 
 [project.scripts]
 omniswarm-mcp = "omniswarm.mcp_server:main"

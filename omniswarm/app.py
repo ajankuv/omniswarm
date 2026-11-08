@@ -340,8 +340,10 @@ def create_app() -> FastAPI:
         s["providers"] = br.state() if br is not None else {}
         s["exhausted_providers"] = sorted(br.exhausted()) if br is not None else []
         # slots off their home model / on an unlisted, exhausted or disallowed model.
-        # degraded_count == 0 is the "all slots where they belong" health signal.
-        s["degraded"] = failover.degraded(app.state.runtime, await catalog.get_cached_catalog(app),
+        # degraded_count == 0 is the "all slots where they belong" health signal. Uses
+        # the already-cached catalog only: /stats must never wait on the gateway (with
+        # nothing cached, the not-in-catalog check is simply skipped).
+        s["degraded"] = failover.degraded(app.state.runtime, getattr(app.state, "catalog", None) or [],
                                           set(s["exhausted_providers"]),
                                           app.state.settings.allowed_providers)
         s["degraded_count"] = len(s["degraded"])

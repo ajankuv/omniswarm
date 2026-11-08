@@ -23,6 +23,10 @@ def client(monkeypatch):
                 "status": "done"}
 
     monkeypatch.setattr(app_module.engine, "process_job", fake_process)
+
+    async def no_gateway(client, base_url, allowed=frozenset()):
+        return []                         # tests never reach a real gateway for the catalog
+    monkeypatch.setattr(app_module.catalog, "fetch_catalog", no_gateway)
     with TestClient(app_module.create_app()) as c:
         yield c
     os.remove(path)
@@ -621,9 +625,13 @@ def _cm(cid):
 @pytest.fixture()
 def fresh_app(monkeypatch, tmp_path):
     """An app with its own DB + runtime file; set env vars before calling."""
-    from omniswarm import registry
+    from omniswarm import catalog, registry
     monkeypatch.setenv("OMNISWARM_DB_PATH", str(tmp_path / "t.db"))
     monkeypatch.setenv("OMNISWARM_RUNTIME", str(tmp_path / "rt.json"))
+
+    async def no_gateway(client, base_url, allowed=frozenset()):
+        return []
+    monkeypatch.setattr(catalog, "fetch_catalog", no_gateway)
     clients = []
 
     def make():
@@ -702,7 +710,7 @@ def test_post_settings_clears_home_for_slot(fresh_app, monkeypatch):
 
 
 def test_stats_degraded_reports_reasons(fresh_app, monkeypatch):
-    from omniswarm import catalog, failover, registry
+    from omniswarm import failover, registry
     monkeypatch.setenv("OMNISWARM_ALLOWED_PROVIDERS", "mistral,nvidia,groq,cerebras")
     c = fresh_app()
     s = c.get("/stats").json()
@@ -715,10 +723,8 @@ def test_stats_degraded_reports_reasons(fresh_app, monkeypatch):
     c.app.state.runtime = rt
     registry.apply_runtime(rt)
     pins = dict(failover.current_pins())
-
-    async def fake(app):
-        return [_cm(m) for m in pins.values() if m != "mistral/gone"]
-    monkeypatch.setattr(catalog, "get_cached_catalog", fake)
+    # /stats reads the already-cached catalog only; it never fetches
+    c.app.state.catalog = [_cm(m) for m in pins.values() if m != "mistral/gone"]
     c.app.state.provider_breaker.record("cerebras/x", ok=False, status="HTTP 403 EXHAUSTED")
     s = c.get("/stats").json()
     by_slot = {d["slot"]: d for d in s["degraded"]}
@@ -749,3 +755,62 @@ def test_models_probe_endpoint_counts_empty_200_as_reachable(fresh_app, monkeypa
     body = c.get("/models/probe?id=nvidia/some/reasoning-model").json()
     assert body["ok"] is True and body["err"] == ""
     assert len(sent) == 1
+
+
+def test_stats_makes_no_gateway_call(fresh_app, monkeypatch):
+    from omniswarm import catalog
+
+    async def boom(*a, **kw):
+        raise AssertionError("/stats must not call the gateway")
+    c = fresh_app()
+    monkeypatch.setattr(catalog, "fetch_catalog", boom)
+    monkeypatch.setattr(catalog, "get_cached_catalog", boom)
+    c.app.state.catalog = None                     # nothing cached yet
+    r = c.get("/stats")
+    assert r.status_code == 200 and r.json()["degraded_count"] == 0
+
+
+def test_post_settings_wins_over_inflight_failover(fresh_app, monkeypatch):
+    """A real POST /settings lands while a failover's probe is in flight: it must not
+    block on the probe, and the failover must not overwrite the operator's choice."""
+    import threading
+
+    from omniswarm import catalog, failover, registry
+    monkeypatch.delenv("OMNISWARM_ALLOWED_PROVIDERS", raising=False)
+
+    async def fake_cat(app):
+        return [_cm("a/failing"), _cm("b/operator"), _cm("c/candidate")]
+    monkeypatch.setattr(catalog, "get_cached_catalog", fake_cat)
+    c = fresh_app()
+    app = c.app
+    pins = {**app.state.runtime, "models": {"code": "a/failing"}, "judge": "a/failing"}
+    app.state.runtime = pins
+    registry.apply_runtime(pins)
+    in_probe, release = threading.Event(), threading.Event()
+
+    async def blocking_probe(cid):
+        import asyncio
+        in_probe.set()
+        while not release.is_set():                # park the failover mid-probe
+            await asyncio.sleep(0.01)
+        return True
+
+    fut = c.portal.start_task_soon(failover.execute, app, "a/failing", blocking_probe)
+    assert in_probe.wait(5)
+    posted = []
+    poster = threading.Thread(target=lambda: posted.append(
+        c.post("/settings", json={"models": {"code": "b/operator"}})))
+    poster.start()
+    poster.join(5)
+    blocked = poster.is_alive()
+    release.set()                                  # unwind either way
+    poster.join(5)
+    swaps = fut.result(timeout=5)
+    assert not blocked, "POST /settings waited on the failover's probe"
+    r = posted[0]
+    assert r.status_code == 200 and r.json()["models"]["code"] == "b/operator"
+    assert swaps == {"judge": "c/candidate"}       # the slot the operator didn't touch moved
+    assert registry.get_task_type("code").model == "b/operator"
+    assert app.state.runtime["models"]["code"] == "b/operator"
+    assert app.state.runtime["failover_home"] == {"judge": "a/failing"}
+    assert c.get("/settings").json()["models"]["code"] == "b/operator"

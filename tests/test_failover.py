@@ -669,23 +669,73 @@ async def test_incident_replay_2026_11_08(wired, tmp_path, allowed):
                 assert route.call_count == 2                     # fail-fast, no retries
 
                 swaps = await failover.execute(app, failing)     # real gateway probe path
+                sent = Counter(json.loads(c.request.content)["model"] for c in route.calls)
+                probes = sum(sent.values()) - 2
+                assert probes <= failover.MAX_PROBES_PER_FAILOVER   # bounded, however many slots
                 if not allowed:
                     # the dead providers got probed, failed ONCE each, and are benched now
-                    sent = Counter(json.loads(c.request.content)["model"] for c in route.calls)
                     dead = {m: n for m, n in sent.items() if failover._provider_of(m) in _DEAD}
                     assert dead and all(n == 1 for n in dead.values())       # no retries
                     assert {failover._provider_of(m) for m in dead} <= breaker.exhausted()
-                    # the slot whose probe budget went on dead providers stays put this
-                    # round; the counter re-trips on its next failure and finishes the job
-                    more = await failover.execute(app, failing)
-                    swaps = {**(swaps or {}), **(more or {})}
     finally:
         adapters.set_sink(None)
 
-    assert len(swaps) == n_slots                                   # every slot moved
+    assert swaps and len(swaps) == n_slots                         # every slot moved, in ONE pass
     picked = Counter(swaps.values())
-    assert {m.split("/", 1)[0] for m in picked} <= {"groq", "nvidia"}   # only providers that answer
-    assert len(picked) == 4                                        # all four live models used
-    assert max(picked.values()) <= -(-n_slots // 4) + 1            # spread, not piled on one
+    assert {m.split("/", 1)[0] for m in picked} == {"groq", "nvidia"}   # only (both) live providers
+    assert len(picked) == (4 if allowed else 3)    # each probe that passed became a distinct pick
+    assert max(picked.values()) <= -(-n_slots // len(picked)) + 1  # spread, not piled on one
     assert set(app.state.runtime["failover_home"].values()) == {failing}
     assert not any(failover._provider_of(m) in _DEAD for _, m in failover.current_pins())
+
+
+# --- gate review fixes -----------------------------------------------------------------
+
+def test_breaker_probe_success_does_not_clear_bench():
+    b = failover.ProviderBreaker(threshold=4, cooldown=600, unavailable_cooldown=12 * 3600)
+    b.record("aug/x", ok=False, status="probe:HTTP 502 UNAVAILABLE")   # probes still trip it
+    assert "aug" in b.exhausted()
+    b.record("aug/y", ok=True, status="probe:ok")       # a 5-token probe isn't proof of recovery
+    assert "aug" in b.exhausted()
+    b.record("aug/y", ok=True, status="ok")             # a real answer is
+    assert "aug" not in b.exhausted()
+    for _ in range(4):
+        b.record("groq/gone", ok=False, status="probe:HTTP 404")
+    assert "groq" not in b.exhausted() and "groq/gone" in b.gone_models()
+
+
+async def test_probe_budget_caps_total_across_slots(wired, tmp_path):
+    # 6 slots x 3 probes each would be 18 calls; the whole failover gets a fixed budget
+    wired["catalog"] = [_m("a/failing")] + [_m(f"p{i:02d}/m") for i in range(30)]
+    app = _fake_app(tmp_path)
+    pins = {"models": {n: "a/failing" for n in registry.REGISTRY}, "judge": "", "synth": "",
+            "members": []}
+    app.state.runtime = dict(pins)
+    registry.apply_runtime(pins)
+    probed = []
+
+    async def fails(cid):
+        probed.append(cid)
+        return False
+    assert await failover.execute(app, "a/failing", probe=fails) is None
+    assert len(probed) == failover.MAX_PROBES_PER_FAILOVER
+    assert len(set(probed)) == len(probed)                # never the same model twice
+
+
+async def test_unpicked_slot_gets_reuse_in_second_pass(wired, tmp_path):
+    # the first slot spends its probes on three duds; the second finds a live model.
+    # A no-probe second pass then gives the first slot that model instead of no swap.
+    wired["catalog"] = [_m("a/failing"), _m("b1/dud"), _m("b2/dud"), _m("b3/dud"), _m("z/live")]
+    app = _fake_app(tmp_path)
+    pins = {"models": {"general": "a/failing", "summarize": "a/failing"}, "judge": "",
+            "synth": "", "members": []}
+    app.state.runtime = dict(pins)
+    registry.apply_runtime(pins)
+    probed = []
+
+    async def only_live(cid):
+        probed.append(cid)
+        return cid == "z/live"
+    swaps = await failover.execute(app, "a/failing", probe=only_live)
+    assert swaps == {"general": "z/live", "summarize": "z/live"}
+    assert probed == ["b1/dud", "b2/dud", "b3/dud", "z/live"]   # the second pass probed nothing

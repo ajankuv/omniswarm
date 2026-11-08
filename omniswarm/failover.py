@@ -15,7 +15,13 @@ import os
 import time
 
 from omniswarm import recommend
-from omniswarm.adapters import _is_permanent, is_exhaustion, is_unavailable, status_code
+from omniswarm.adapters import (
+    PROBE_PREFIX,
+    _is_permanent,
+    is_exhaustion,
+    is_unavailable,
+    status_code,
+)
 
 log = logging.getLogger("omniswarm.failover")
 
@@ -34,6 +40,7 @@ PROVIDER_UNAVAILABLE_COOLDOWN = float(os.environ.get("OMNISWARM_PROVIDER_UNAVAIL
 _MODEL_ONLY_HTTP = frozenset({404, 410})
 
 MAX_PROBES = 3             # unproven candidates probed per slot before giving up
+MAX_PROBES_PER_FAILOVER = 6   # probes across ALL slots of one failover (shared budget)
 
 
 def _provider_of(model: str) -> str:
@@ -65,6 +72,8 @@ class ProviderBreaker:
         if self.threshold <= 0:
             return
         p = _provider_of(model)
+        if ok and status.startswith(PROBE_PREFIX):
+            return                                   # a 5-token probe isn't proof of recovery
         if ok:
             self._perm_fails[p] = 0                  # a success clears the provider
             self._unavailable_at.pop(p, None)
@@ -251,7 +260,8 @@ async def choose_replacement(slot: str, catalog: list[dict], reliability: dict,
                              quality: dict, exclude: set[str], *, probe=None,
                              probe_results: dict | None = None, picked: dict | None = None,
                              avoid_providers: frozenset[str] | set[str] = frozenset(),
-                             max_probes: int = MAX_PROBES) -> str | None:
+                             max_probes: int = MAX_PROBES,
+                             max_total_probes: int = MAX_PROBES_PER_FAILOVER) -> str | None:
     """Pick a replacement for `slot`, excluding failing/cooling-down/dead models.
 
     Auto-failover must land on something KNOWN-GOOD. The recommender ranks a shiny
@@ -261,8 +271,9 @@ async def choose_replacement(slot: str, catalog: list[dict], reliability: dict,
       1. the best-ranked PROVEN-healthy candidate, preferring a provider not in
          `avoid_providers` and a model not already `picked` for another slot;
       2. unproven candidates in rank order (never-tried first, zero-success last),
-         used only once `probe(id)` passes; at most `max_probes` probes, results
-         cached in `probe_results` across slots of one failover;
+         used only once `probe(id)` passes; at most `max_probes` probes here, and
+         `probe_results` (shared across the slots of one failover) caches results and
+         caps the failover's total at `max_total_probes`;
       3. reuse of an already-picked model (the least-picked first) over no swap.
     No probe function means unproven candidates are never used. `exclude` is checked
     again before each probe, so the caller can grow it while probing (a failed probe
@@ -284,12 +295,13 @@ async def choose_replacement(slot: str, catalog: list[dict], reliability: dict,
     for c in _fresh_diverse(proven):
         return c
     probes = 0
-    for c in _fresh_diverse(unproven):
+    never_tried = [c for c in unproven if not _zero_success(c, reliability)]
+    for c in _fresh_diverse(never_tried) + _fresh_diverse([c for c in unproven if c not in never_tried]):
         if c in exclude:
             continue
         if c not in results:
-            if probe is None or probes >= max_probes:
-                break
+            if probe is None or probes >= max_probes or len(results) >= max_total_probes:
+                continue                        # no budget: only cached results count now
             probes += 1
             try:
                 results[c] = bool(await probe(c))
@@ -368,6 +380,17 @@ async def execute(app, model: str, probe=None) -> dict | None:
             rep = await choose_replacement(rank_slot, cat, rel, quality, exclude, probe=_probe,
                                            probe_results=probe_results, picked=picked,
                                            avoid_providers=avoid)
+            if rep:
+                picks[key] = rep
+                picked[rep] = picked.get(rep, 0) + 1
+        # second pass, no new probes: a slot whose probes went on duds (or that ran out
+        # of budget) takes a cached pass or the least-used pick instead of no swap
+        for key, rank_slot in wanted:
+            if key in picks:
+                continue
+            rep = await choose_replacement(rank_slot, cat, rel, quality, exclude, probe=None,
+                                           probe_results=probe_results, picked=picked,
+                                           avoid_providers={_provider_of(model)})
             if rep:
                 picks[key] = rep
                 picked[rep] = picked.get(rep, 0) + 1

@@ -15,3 +15,10 @@ def test_env_overrides(monkeypatch):
     s = get_settings()
     assert s.db_path == "/tmp/custom.db"
     assert s.omniroute_base_url == "http://example/v1"
+
+
+def test_allowed_providers_parsing(monkeypatch):
+    monkeypatch.delenv("OMNISWARM_ALLOWED_PROVIDERS", raising=False)
+    assert get_settings().allowed_providers == frozenset()         # default: no restriction
+    monkeypatch.setenv("OMNISWARM_ALLOWED_PROVIDERS", " mistral, gemini/ ,,groq ")
+    assert get_settings().allowed_providers == frozenset({"mistral", "gemini", "groq"})

@@ -366,7 +366,9 @@ def model_reliability(path: str) -> dict:
         rows = con.execute(
             "SELECT model, COUNT(*) AS calls, SUM(ok) AS oks, AVG(latency_ms) AS lat, "
             "SUM(CASE WHEN status='HTTP 429' THEN 1 ELSE 0 END) AS r429 "
-            "FROM model_calls GROUP BY model"
+            # liveness probes (status "probe:…") are tiny checks, not real work: they
+            # must not make a model look proven-healthy to auto-failover
+            "FROM model_calls WHERE COALESCE(status, '') NOT LIKE 'probe:%' GROUP BY model"
         ).fetchall()
         out = {}
         for r in rows:

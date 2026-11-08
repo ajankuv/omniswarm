@@ -4,7 +4,10 @@ import os
 
 DEFAULTS = {"api_token": "", "rate_limit_per_min": 0, "store_mode": "full",
             "active_roster": [], "always_council": True,
-            "models": {}, "judge": "", "synth": "", "members": []}
+            "models": {}, "judge": "", "synth": "", "members": [],
+            # slot -> the model it was on before auto-failover first moved it
+            # ("code", "judge", "synth", "member:<role>"); cleared when you set the slot
+            "failover_home": {}}
 _VALID_MODES = {"full", "redact", "none"}
 
 
@@ -14,7 +17,7 @@ def _discover(path: str | None) -> str:
 
 def load_runtime(path: str | None = None) -> dict:
     cfg = {**DEFAULTS, "active_roster": list(DEFAULTS["active_roster"]),
-           "models": {}, "judge": "", "synth": "", "members": []}
+           "models": {}, "judge": "", "synth": "", "members": [], "failover_home": {}}
     p = _discover(path)
     if p and os.path.exists(p):
         try:
@@ -43,6 +46,9 @@ def load_runtime(path: str | None = None) -> dict:
                         for m in data["members"]
                         if isinstance(m, dict) and "role" in m and "model" in m
                     ]
+                if isinstance(data.get("failover_home"), dict):
+                    cfg["failover_home"] = {str(k): v for k, v in data["failover_home"].items()
+                                            if isinstance(v, str)}
         except (json.JSONDecodeError, OSError):
             pass
     return cfg

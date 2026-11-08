@@ -292,3 +292,15 @@ def test_list_jobs_tolerates_bad_limit(db_path):
         rows = store.list_jobs(db_path, limit=bad)   # must not raise
         assert isinstance(rows, list)
     assert len(store.list_jobs(db_path, limit=0)) == 0
+
+
+def test_probe_calls_excluded_from_reliability(db_path):
+    # a liveness probe must not make a model look "proven" for auto-failover
+    for _ in range(5):
+        store.record_model_call(db_path, "prov/probed", True, 100.0, "probe:ok")
+    store.record_model_call(db_path, "prov/mixed", False, 100.0, "HTTP 503")
+    store.record_model_call(db_path, "prov/mixed", False, 100.0, "HTTP 503")
+    store.record_model_call(db_path, "prov/mixed", True, 100.0, "probe:ok")
+    rel = store.model_reliability(db_path)
+    assert "prov/probed" not in rel
+    assert rel["prov/mixed"]["calls"] == 2 and rel["prov/mixed"]["ok"] == 0

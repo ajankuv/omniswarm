@@ -14,8 +14,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from omniswarm import benchmarks, catalog, engine, events, failover, recommend, registry, runtime, store
-from omniswarm.adapters import OmniRouteError, generate, health
+from omniswarm import __version__, adapters, benchmarks, catalog, engine, events, failover, recommend, registry, runtime, store
+from omniswarm.adapters import health
 from omniswarm.config import get_settings
 from omniswarm.util import new_id
 
@@ -94,7 +94,6 @@ def create_app() -> FastAPI:
         registry.apply_runtime(app.state.runtime)     # apply persisted model overrides live
         app.state.catalog = None
         app.state.catalog_at = 0.0
-        from omniswarm import adapters as _adapters
         _db = settings.db_path
         app.state.failover = failover.FailoverTracker()
         app.state.provider_breaker = failover.ProviderBreaker()
@@ -109,7 +108,7 @@ def create_app() -> FastAPI:
                 app.state.bg_tasks.add(task)
                 task.add_done_callback(app.state.bg_tasks.discard)
 
-        _adapters.set_sink(_sink)
+        adapters.set_sink(_sink)
         try:
             app.state.omniroute_ok = await health(app.state.client, settings.omniroute_base_url)
         except Exception:
@@ -124,7 +123,7 @@ def create_app() -> FastAPI:
             app.state.scheduler_task.cancel()
             await app.state.client.aclose()
 
-    app = FastAPI(title="OmniSwarm", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="OmniSwarm", version=__version__, lifespan=lifespan)
 
     import time as _time
     _rl: dict[str, list[float]] = {}
@@ -340,6 +339,14 @@ def create_app() -> FastAPI:
         br = getattr(app.state, "provider_breaker", None)
         s["providers"] = br.state() if br is not None else {}
         s["exhausted_providers"] = sorted(br.exhausted()) if br is not None else []
+        # slots off their home model / on an unlisted, exhausted or disallowed model.
+        # degraded_count == 0 is the "all slots where they belong" health signal. Uses
+        # the already-cached catalog only: /stats must never wait on the gateway (with
+        # nothing cached, the not-in-catalog check is simply skipped).
+        s["degraded"] = failover.degraded(app.state.runtime, getattr(app.state, "catalog", None) or [],
+                                          set(s["exhausted_providers"]),
+                                          app.state.settings.allowed_providers)
+        s["degraded_count"] = len(s["degraded"])
         return s
 
     @app.get("/reliability", dependencies=[Depends(_auth)])
@@ -362,54 +369,64 @@ def create_app() -> FastAPI:
             "always_council": rt.get("always_council", True),
             "judge": registry.JUDGE_MODEL,
             "synth": registry.COUNCIL_SYNTH_MODEL,
+            "failover_home": rt.get("failover_home", {}),
         }
 
     @app.post("/settings", dependencies=[Depends(_auth)])
     async def post_settings_route(request: Request):
         body = await request.json()
-        rt = dict(app.state.runtime)
-        if "api_token" in body and isinstance(body["api_token"], str):
-            rt["api_token"] = body["api_token"]
-        if "rate_limit_per_min" in body and isinstance(body["rate_limit_per_min"], int):
-            rt["rate_limit_per_min"] = max(0, body["rate_limit_per_min"])
-        if body.get("store_mode") in ("full", "redact", "none"):
-            rt["store_mode"] = body["store_mode"]
-            # Cached answers hold plaintext that only "full" mode permits. Tightening
-            # the privacy mode must not leave it readable — or servable — afterwards.
-            if rt["store_mode"] != "full":
-                store.cache_clear(app.state.settings.db_path)
-        if isinstance(body.get("active_roster"), list):
-            valid = {m["role"] for m in registry.COUNCIL_MEMBERS}
-            rt["active_roster"] = [r for r in body["active_roster"] if r in valid]
-        if isinstance(body.get("always_council"), bool):
-            rt["always_council"] = body["always_council"]
         cat_ids = {m["id"] for m in await catalog.get_cached_catalog(app)}
+        allowed = app.state.settings.allowed_providers
 
         def _valid(mid):
-            return isinstance(mid, str) and mid in cat_ids and not mid.startswith(("auto/", "tllm/"))
+            return (catalog.is_routable(mid) and mid in cat_ids
+                    and catalog.provider_allowed(mid, allowed))
 
-        # Only touch model overrides when we have a catalog to validate against;
-        # otherwise an unavailable gateway would silently wipe the model map to defaults.
-        if cat_ids:
-            if isinstance(body.get("models"), dict):
-                # MERGE validated entries into the existing overrides — don't replace.
-                # A replace meant a partial update dropped other slots, and an
-                # all-invalid dict wiped every override to {} (silent config loss).
-                merged = dict(rt.get("models") or {})
-                for k, v in body["models"].items():
-                    if _valid(v):
-                        merged[str(k)] = v
-                rt["models"] = merged
-            if _valid(body.get("judge")):
-                rt["judge"] = body["judge"]
-            if _valid(body.get("synth")):
-                rt["synth"] = body["synth"]
-            if isinstance(body.get("members"), list):
-                rt["members"] = [{"role": str(m["role"]), "model": m["model"]}
-                                 for m in body["members"]
-                                 if isinstance(m, dict) and "role" in m and _valid(m.get("model"))]
-        # serialize with auto-failover so concurrent saves can't clobber each other
+        # Build on the runtime as it is UNDER the lock, so a concurrent auto-failover
+        # swap and this save can't clobber each other in either direction.
         async with app.state.settings_lock:
+            rt = dict(app.state.runtime)
+            if "api_token" in body and isinstance(body["api_token"], str):
+                rt["api_token"] = body["api_token"]
+            if "rate_limit_per_min" in body and isinstance(body["rate_limit_per_min"], int):
+                rt["rate_limit_per_min"] = max(0, body["rate_limit_per_min"])
+            if body.get("store_mode") in ("full", "redact", "none"):
+                rt["store_mode"] = body["store_mode"]
+                # Cached answers hold plaintext that only "full" mode permits. Tightening
+                # the privacy mode must not leave it readable — or servable — afterwards.
+                if rt["store_mode"] != "full":
+                    store.cache_clear(app.state.settings.db_path)
+            if isinstance(body.get("active_roster"), list):
+                valid = {m["role"] for m in registry.COUNCIL_MEMBERS}
+                rt["active_roster"] = [r for r in body["active_roster"] if r in valid]
+            if isinstance(body.get("always_council"), bool):
+                rt["always_council"] = body["always_council"]
+            # a slot you set yourself is home again: drop its auto-failover home entry
+            home = dict(rt.get("failover_home") or {})
+            # Only touch model overrides when we have a catalog to validate against;
+            # otherwise an unavailable gateway would silently wipe the model map to defaults.
+            if cat_ids:
+                if isinstance(body.get("models"), dict):
+                    # MERGE validated entries into the existing overrides — don't replace.
+                    # A replace meant a partial update dropped other slots, and an
+                    # all-invalid dict wiped every override to {} (silent config loss).
+                    merged = dict(rt.get("models") or {})
+                    for k, v in body["models"].items():
+                        if _valid(v):
+                            merged[str(k)] = v
+                            home.pop(str(k), None)
+                    rt["models"] = merged
+                for slot in ("judge", "synth"):
+                    if _valid(body.get(slot)):
+                        rt[slot] = body[slot]
+                        home.pop(slot, None)
+                if isinstance(body.get("members"), list):
+                    rt["members"] = [{"role": str(m["role"]), "model": m["model"]}
+                                     for m in body["members"]
+                                     if isinstance(m, dict) and "role" in m and _valid(m.get("model"))]
+                    for m in rt["members"]:
+                        home.pop(f"member:{m['role']}", None)
+            rt["failover_home"] = home
             runtime.save_runtime(None, rt)
             app.state.runtime = rt
             registry.apply_runtime(rt)
@@ -442,15 +459,14 @@ def create_app() -> FastAPI:
     @app.get("/models/probe", dependencies=[Depends(_auth)])
     async def models_probe(id: str):
         cat = await catalog.get_cached_catalog(app)
-        if id not in {m["id"] for m in cat}:
+        if (id not in {m["id"] for m in cat}
+                or not catalog.provider_allowed(id, app.state.settings.allowed_providers)):
             raise HTTPException(status_code=400, detail="unknown model id")
         t0 = _time.time()
-        try:
-            await generate(app.state.client, app.state.settings.omniroute_base_url, id,
-                           "Reply with one word.", "ping", max_tokens=5, max_retries=0)
-            return {"ok": True, "latency": round(_time.time() - t0, 2), "err": ""}
-        except OmniRouteError as e:
-            return {"ok": False, "latency": round(_time.time() - t0, 2), "err": str(e)[:120]}
+        # same probe auto-failover uses: 5 tokens, no retries, a 200 with empty content
+        # (a reasoning model thinking) counts as reachable
+        ok, err = await adapters.probe(app.state.client, app.state.settings.omniroute_base_url, id)
+        return {"ok": ok, "latency": round(_time.time() - t0, 2), "err": err[:120]}
 
     class BenchmarkIn(BaseModel):
         task_type: str = "general"
@@ -461,8 +477,9 @@ def create_app() -> FastAPI:
         if body.task_type not in benchmarks.OBJECTIVE_BANKS and body.task_type not in benchmarks.RUBRIC_BANKS:
             raise HTTPException(status_code=400, detail="unknown task_type")
         cat_ids = {m["id"] for m in await catalog.get_cached_catalog(app)}
+        allowed = app.state.settings.allowed_providers
         cands = [c for c in body.candidates
-                 if isinstance(c, str) and c in cat_ids and not c.startswith(("auto/", "tllm/"))]
+                 if catalog.is_routable(c) and c in cat_ids and catalog.provider_allowed(c, allowed)]
         if not cands:
             raise HTTPException(status_code=400, detail="no valid candidate models")
         bid = new_id()

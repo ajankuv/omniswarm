@@ -81,7 +81,9 @@ def _capability_why(slot: str, m: dict) -> str:
     return ", ".join(bits) or "general model"
 
 
-def recommend(slot: str, catalog: list[dict], reliability: dict, quality: dict = None) -> dict:
+def recommend(slot: str, catalog: list[dict], reliability: dict, quality: dict = None,
+              limit: int | None = 8) -> dict:
+    """Rank `catalog` for `slot`. `ranked` holds the top `limit` (None = all of them)."""
     scored = []
     for m in catalog:
         if not _eligible(slot, m):
@@ -107,7 +109,7 @@ def recommend(slot: str, catalog: list[dict], reliability: dict, quality: dict =
             why = f"benchmarked {pct}% ({q.get('samples','?')} samples) · {q.get('avg_latency_ms',0)/1000:.1f}s · " + why
         scored.append({"id": m["id"], "score": score, "why": why, "_dead": dead})
     scored.sort(key=lambda x: (-x["score"], x["id"]))
-    ranked = [{"id": s["id"], "score": round(s["score"], 1), "why": s["why"]} for s in scored[:8]]
+    ranked = [{"id": s["id"], "score": round(s["score"], 1), "why": s["why"]} for s in scored[:limit]]
     top = None
     for s in scored:
         if not s["_dead"]:

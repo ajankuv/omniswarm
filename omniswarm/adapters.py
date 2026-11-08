@@ -34,15 +34,23 @@ class OmniRouteError(Exception):
 _PERMANENT_HTTP = frozenset({401, 402, 403, 404, 405, 410, 429})
 
 
-def _is_permanent(status: str) -> bool:
-    """True for a status string like 'HTTP 403' whose code is non-retryable."""
+def status_code(status: str) -> int | None:
+    """The HTTP code in a status string like 'HTTP 404 EXHAUSTED', else None."""
     if status.startswith("HTTP "):
         code = status[5:].split()[0] if status[5:] else ""
         try:
-            return int(code) in _PERMANENT_HTTP
+            return int(code)
         except ValueError:
-            return False
-    return False
+            return None
+    return None
+
+
+def _is_permanent(status: str) -> bool:
+    """True for a status string like 'HTTP 403' whose code is non-retryable, or one
+    tagged UNAVAILABLE (the provider can't run at all, whatever the code)."""
+    if is_unavailable(status):
+        return True
+    return status_code(status) in _PERMANENT_HTTP
 
 
 # Explicit provider-exhaustion signals the gateway puts in the error body — these are
@@ -68,6 +76,36 @@ def _is_exhaustion_body(text: str) -> bool:
 def is_exhaustion(status: str) -> bool:
     """The breaker's fast-trip signal: an explicit provider-exhaustion response."""
     return "EXHAUSTED" in status
+
+
+# Error bodies meaning the provider CAN'T RUN AT ALL in this deployment: a missing
+# CLI/browser/binary, an unconfigured transport, a bad install path. Gateways often
+# return these as 502/503, but no retry or wait will ever fix them, so they're
+# permanent (no retries) and trip the provider breaker on first sight. Matched
+# case-insensitively as substrings; keep them specific, so a plain "model not found"
+# (one gone model, a 404) or a generic overload 503 stays out.
+_UNAVAILABLE_MARKERS = (
+    "cli not found",
+    "not installed",
+    "needs install", "need to install", "needs to be installed",
+    "requires install", "must be installed",
+    "playwright",
+    "not configured",
+    "must be an absolute path",
+)
+
+
+def _is_unavailable_body(text: str) -> bool:
+    """True if the gateway's error body says the provider can't run here at all."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(mk in low for mk in _UNAVAILABLE_MARKERS)
+
+
+def is_unavailable(status: str) -> bool:
+    """A provider-can't-run response: permanent, and benches the whole provider."""
+    return "UNAVAILABLE" in status
 
 
 def _is_reasoning(model: str) -> bool:
@@ -126,7 +164,10 @@ async def generate(
     user: str,
     max_tokens: int = 512,
     max_retries: int = 2,
+    allow_empty: bool = False,
 ) -> str:
+    """One chat call with retries. `allow_empty` counts an HTTP 200 with no content as
+    success (used by `probe`: reasoning models can spend a tiny budget thinking)."""
     url = f"{base_url}/chat/completions"
     body = _build_body(model, system, user, max_tokens)
     headers = {"Content-Type": "application/json"}  # NO auth header (footgun)
@@ -146,6 +187,8 @@ async def generate(
                 # counting blind HTTP codes.
                 if _is_exhaustion_body(resp.text):
                     status += " EXHAUSTED"
+                elif _is_unavailable_body(resp.text):
+                    status += " UNAVAILABLE"
                 last_err = status
             else:
                 if body["stream"]:
@@ -153,7 +196,7 @@ async def generate(
                 else:
                     msg = resp.json()["choices"][0]["message"]
                     out = _content_from_message(msg)
-                if out:
+                if out or allow_empty:
                     ok = True
                 else:
                     status = "empty"; last_err = "empty content"
@@ -162,12 +205,26 @@ async def generate(
         _emit(model, ok, (time.perf_counter() - t0) * 1000.0, status)
         if ok:
             return out
-        # fail fast on quota/auth/gone — retrying can't help and only burns a dead provider
+        # fail fast on quota/auth/gone/can't-run — retrying can't help and only burns a dead provider
         if _is_permanent(status):
-            raise OmniRouteError(f"{model} failed ({status}) — not retrying (permanent/quota)")
+            why = "provider can't run" if is_unavailable(status) else "permanent/quota"
+            raise OmniRouteError(f"{model} failed ({status}) — not retrying ({why})")
         if attempt < max_retries:
             await asyncio.sleep((2 ** attempt) * 0.5 + random.uniform(0, 0.3))
     raise OmniRouteError(f"{model} failed after {max_retries + 1} attempts: {last_err}")
+
+
+async def probe(client: httpx.AsyncClient, base_url: str, model: str) -> tuple[bool, str]:
+    """Cheapest real check that a model answers: one ~5-token call, no retries. Goes
+    through `generate`, so the sink (reliability store, provider breaker, failover
+    counter) learns from the result like any other call. An HTTP 200 with empty
+    content counts as reachable: reasoning models spend the tiny budget thinking."""
+    try:
+        await generate(client, base_url, model, "Reply with one word.", "ping",
+                       max_tokens=5, max_retries=0, allow_empty=True)
+        return True, ""
+    except OmniRouteError as e:
+        return False, str(e)
 
 
 async def health(client: httpx.AsyncClient, base_url: str) -> bool:

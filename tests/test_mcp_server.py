@@ -126,7 +126,7 @@ async def test_submit_records_unexpected_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_recommend_returns_pick(monkeypatch):
-    async def fake_fetch(client, base_url):
+    async def fake_fetch(client, base_url, allowed=frozenset()):
         return [{"id": "mistral/devstral-latest", "provider": "mistral", "name": "Devstral",
                  "capabilities": {"tool_calling": True, "reasoning": False, "thinking": False},
                  "context_length": 256000, "max_output_tokens": 8192, "chat_capable": True}]
@@ -140,7 +140,7 @@ async def test_recommend_returns_pick(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_recommend_graceful_when_catalog_down(monkeypatch):
-    async def boom(client, base_url):
+    async def boom(client, base_url, allowed=frozenset()):
         raise RuntimeError("gateway down")
     monkeypatch.setattr(mcp_server, "_get_client", lambda: None)
     monkeypatch.setattr(mcp_server.catalog, "fetch_catalog", boom)

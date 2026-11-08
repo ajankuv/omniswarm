@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 
+from omniswarm.catalog import is_routable
 from omniswarm.modelconfig import load_model_config
 
 _R = "Numbered evaluation steps:\n1. Is the answer directly responsive to the task?\n2. Is it factually consistent and free of obvious errors?\n3. Is it complete for what was asked?\n4. Ignore length; do not reward verbosity."
@@ -35,7 +36,7 @@ def build_registry(cfg: dict) -> dict[str, "TaskType"]:
 
 def _ok(mid: object) -> bool:
     """Return True only for non-empty, non-auto/, non-tllm/ model IDs."""
-    return isinstance(mid, str) and bool(mid) and not mid.startswith(("auto/", "tllm/"))
+    return is_routable(mid)
 
 
 def effective_config(overrides: dict) -> dict:

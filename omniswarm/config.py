@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,13 @@ class Settings:
     cache_min_confidence: str
     cache_max_entries: int
     savings_usd_per_mtok: float
+    # provider prefixes models may come from; empty = no restriction
+    allowed_providers: frozenset[str] = field(default_factory=frozenset)
+
+
+def _providers(raw: str) -> frozenset[str]:
+    """'mistral, gemini/ ,groq' -> {'mistral', 'gemini', 'groq'}."""
+    return frozenset(p.strip().rstrip("/") for p in raw.split(",") if p.strip().rstrip("/"))
 
 
 def get_settings() -> Settings:
@@ -35,4 +42,9 @@ def get_settings() -> Settings:
         # blended $/1M tokens of the premium model you'd otherwise pay for;
         # ~GPT-4o / Claude Sonnet input+output. Drives the dashboard "$ saved" stat.
         savings_usd_per_mtok=float(os.environ.get("OMNISWARM_SAVINGS_USD_PER_MTOK", "5")),
+        # only offer/accept models from these gateway providers (comma-separated
+        # prefixes, e.g. "mistral,gemini,groq"). Empty = every provider the gateway lists.
+        # Keeps the catalog, recommender and auto-failover off providers that can't
+        # run in your deployment; a new gateway provider then needs an explicit opt-in.
+        allowed_providers=_providers(os.environ.get("OMNISWARM_ALLOWED_PROVIDERS", "")),
     )

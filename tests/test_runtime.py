@@ -71,3 +71,12 @@ def test_malformed_model_overrides_ignored(tmp_path):
     cfg = runtime.load_runtime(str(p))
     assert cfg["models"] == {}                       # non-dict ignored
     assert cfg["members"] == [{"role": "R", "model": "m/x"}]  # only well-formed kept
+
+
+def test_failover_home_roundtrip(tmp_path):
+    p = str(tmp_path / "rt.json")
+    assert runtime.load_runtime(p)["failover_home"] == {}
+    runtime.save_runtime(p, {"failover_home": {"judge": "a/home", "member:Fact-Checker": "b/x",
+                                               "bad": 3}})
+    assert runtime.load_runtime(p)["failover_home"] == {"judge": "a/home",
+                                                         "member:Fact-Checker": "b/x"}

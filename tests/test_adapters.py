@@ -168,3 +168,91 @@ async def test_explicit_exhaustion_status_surfaced():
         assert seen and "EXHAUSTED" in seen[-1]     # explicit signal surfaced
     finally:
         ad.set_sink(None)
+
+
+# --- v1.3.1: "can't run here" error bodies are permanent ------------------------------
+
+@pytest.mark.parametrize("code,message", [
+    (502, "Auggie CLI not found"),
+    (503, "Cloudflare Playground needs Playwright and its Chromium browser"),
+    (500, "DEVIN_AGENTIC_HOME must be an absolute path"),
+    (503, "Codex app-server transport is not configured"),
+    (503, "The FOO-TOOL binary is NOT INSTALLED on this host"),
+    (500, "This provider requires installing an extra package"),
+])
+@respx.mock
+@pytest.mark.asyncio
+async def test_unavailable_body_is_permanent_not_retried(code, message):
+    from omniswarm import adapters as ad
+    seen = []
+    ad.set_sink(lambda m, ok, lat, status: seen.append(status))
+    try:
+        route = respx.post(f"{BASE}/chat/completions").mock(
+            return_value=httpx.Response(code, json={"error": {"message": message}}))
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(OmniRouteError):
+                await generate(client, BASE, "prov/x", "s", "u", max_retries=3)
+        assert route.call_count == 1                      # no retries: it can't ever work
+        assert seen == [f"HTTP {code} UNAVAILABLE"]
+        assert ad._is_permanent(seen[0]) and ad.is_unavailable(seen[0])
+    finally:
+        ad.set_sink(None)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_generic_503_still_transient():
+    from omniswarm import adapters as ad
+    seen = []
+    ad.set_sink(lambda m, ok, lat, status: seen.append(status))
+    try:
+        route = respx.post(f"{BASE}/chat/completions").mock(
+            return_value=httpx.Response(503, json={"error": {"message": "upstream overloaded, try again"}}))
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(OmniRouteError):
+                await generate(client, BASE, "prov/x", "s", "u", max_retries=2)
+        assert route.call_count == 3                      # still retried
+        assert seen == ["HTTP 503"] * 3
+        assert not ad._is_permanent("HTTP 503") and not ad.is_unavailable("HTTP 503")
+        # "model not found" is a 404 about ONE model, not a can't-run provider
+        assert not ad._is_unavailable_body('{"error":{"message":"model xyz not found"}}')
+    finally:
+        ad.set_sink(None)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_probe_is_one_tiny_call():
+    from omniswarm import adapters as ad
+    route = respx.post(f"{BASE}/chat/completions").mock(return_value=httpx.Response(503))
+    async with httpx.AsyncClient() as client:
+        ok, err = await ad.probe(client, BASE, "prov/x")
+        assert ok is False and "503" in err
+        assert route.call_count == 1                      # max_retries=0
+        assert __import__("json").loads(route.calls[0].request.content)["max_tokens"] == 5
+        route.mock(return_value=httpx.Response(200, json=_chat_json("pong")))
+        assert await ad.probe(client, BASE, "prov/x") == (True, "")
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_probe_counts_empty_200_as_reachable():
+    # Reasoning models spend a tiny max_tokens budget on hidden reasoning and come back
+    # 200 with empty content (finish_reason=length). They answer fine with a real
+    # budget, so a probe must not call them dead. Normal calls still treat empty as a
+    # failure and retry.
+    from omniswarm import adapters as ad
+    seen = []
+    ad.set_sink(lambda m, ok, lat, status: seen.append((ok, status)))
+    try:
+        route = respx.post(f"{BASE}/chat/completions").mock(return_value=httpx.Response(
+            200, json={"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}))
+        async with httpx.AsyncClient() as client:
+            assert await ad.probe(client, BASE, "nvidia/some/reasoning-model") == (True, "")
+            assert route.call_count == 1
+            assert seen == [(True, "ok")]           # sink learns it is reachable
+            with pytest.raises(OmniRouteError):    # a real job still needs content
+                await generate(client, BASE, "nvidia/some/reasoning-model", "s", "u", max_retries=1)
+            assert route.call_count == 3
+    finally:
+        ad.set_sink(None)

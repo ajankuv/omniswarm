@@ -293,7 +293,8 @@ async def omniswarm_recommend(task_type: str = "general") -> dict:
     OmniSwarm's own success/latency history. Use this to self-select a model before
     delegating. Returns {"recommended": <id or null>, "ranked": [...], "why": <str>}."""
     try:
-        cat = await catalog.fetch_catalog(_get_client(), _settings.omniroute_base_url)
+        cat = await catalog.fetch_catalog(_get_client(), _settings.omniroute_base_url,
+                                          _settings.allowed_providers)
     except Exception:
         return {"recommended": None, "ranked": [], "why": "catalog unavailable"}
     rel = await asyncio.to_thread(store.model_reliability, _settings.db_path)

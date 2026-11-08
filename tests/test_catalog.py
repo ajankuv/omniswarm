@@ -42,7 +42,7 @@ def test_normalize_missing_fields_default_safely():
 async def test_get_cached_catalog_uses_cache(monkeypatch):
     calls = {"n": 0}
 
-    async def fake_fetch(client, base_url):
+    async def fake_fetch(client, base_url, allowed=frozenset()):
         calls["n"] += 1
         return [{"id": "nvidia/x", "provider": "nvidia", "name": "x",
                  "capabilities": {"tool_calling": False, "reasoning": False, "thinking": False},
@@ -63,7 +63,7 @@ async def test_get_cached_catalog_uses_cache(monkeypatch):
 async def test_get_cached_catalog_returns_stale_on_fetch_error(monkeypatch):
     state = {"first": True}
 
-    async def flaky_fetch(client, base_url):
+    async def flaky_fetch(client, base_url, allowed=frozenset()):
         if state["first"]:
             state["first"] = False
             return [{"id": "nvidia/x", "provider": "nvidia", "name": "x",
@@ -80,3 +80,16 @@ async def test_get_cached_catalog_returns_stale_on_fetch_error(monkeypatch):
     first = await catalog.get_cached_catalog(app)
     second = await catalog.get_cached_catalog(app)  # fetch raises -> serve stale
     assert first == second and second[0]["id"] == "nvidia/x"
+
+
+def test_allowed_providers_filter():
+    raw = [{"id": "mistral/a"}, {"id": "aug/gpt5"}, {"id": "groq/x/y"}, {"id": "auto/best"}]
+    assert [m["id"] for m in catalog.normalize_models(raw)] == ["aug/gpt5", "groq/x/y", "mistral/a"]
+    allowed = frozenset({"mistral", "groq"})
+    assert [m["id"] for m in catalog.normalize_models(raw, allowed)] == ["groq/x/y", "mistral/a"]
+    assert catalog.provider_allowed("mistral/a", allowed)
+    assert not catalog.provider_allowed("aug/gpt5", allowed)
+    assert catalog.provider_allowed("aug/gpt5", frozenset())        # empty = no restriction
+    assert not catalog.is_routable("auto/best") and not catalog.is_routable("tllm/x")
+    assert not catalog.is_routable("") and not catalog.is_routable(None)
+    assert catalog.is_routable("mistral/a")

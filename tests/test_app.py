@@ -608,3 +608,144 @@ def test_dashboard_has_provider_banner(client):
     assert 'id="provider-banner"' in html
     assert "renderProviderBanner" in html
     assert "exhausted_providers" in html
+
+
+# --- v1.3.1: provider allowlist, failover home, degraded slots ------------------------
+
+def _cm(cid):
+    return {"id": cid, "provider": cid.split("/", 1)[0], "name": cid,
+            "capabilities": {"tool_calling": True, "reasoning": False, "thinking": False},
+            "context_length": 128000, "max_output_tokens": 8192, "chat_capable": True}
+
+
+@pytest.fixture()
+def fresh_app(monkeypatch, tmp_path):
+    """An app with its own DB + runtime file; set env vars before calling."""
+    from omniswarm import registry
+    monkeypatch.setenv("OMNISWARM_DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setenv("OMNISWARM_RUNTIME", str(tmp_path / "rt.json"))
+    clients = []
+
+    def make():
+        c = TestClient(app_module.create_app())
+        c.__enter__()
+        clients.append(c)
+        return c
+    yield make
+    for c in clients:
+        c.__exit__(None, None, None)
+    registry.apply_runtime({})
+
+
+def test_allowed_providers_filters_catalog_and_settings(fresh_app, monkeypatch):
+    from omniswarm import catalog, registry
+    monkeypatch.setenv("OMNISWARM_ALLOWED_PROVIDERS", "mistral,groq")
+    raw = [{"id": i} for i in ("mistral/devstral-latest", "groq/llama-3.3-70b", "aug/gpt5", "cfp/kimi")]
+
+    async def fake_fetch(client, base_url, allowed=frozenset()):
+        return catalog.normalize_models(raw, allowed)
+    monkeypatch.setattr(catalog, "fetch_catalog", fake_fetch)
+    c = fresh_app()
+    ids = [m["id"] for m in c.get("/models/available").json()["models"]]
+    assert ids == ["groq/llama-3.3-70b", "mistral/devstral-latest"]
+    rec = c.get("/models/recommend").json()
+    assert all(r["id"].split("/")[0] in {"mistral", "groq"} for r in rec["general"]["ranked"])
+
+    # settings validation rejects other providers even if the gateway lists them
+    async def full_cat(app):
+        return catalog.normalize_models(raw)
+    monkeypatch.setattr(catalog, "get_cached_catalog", full_cat)
+    r = c.post("/settings", json={"models": {"code": "aug/gpt5", "draft": "groq/llama-3.3-70b"},
+                                  "judge": "cfp/kimi"})
+    assert r.status_code == 200
+    assert registry.get_task_type("code").model != "aug/gpt5"
+    assert registry.get_task_type("draft").model == "groq/llama-3.3-70b"
+    assert registry.JUDGE_MODEL != "cfp/kimi"
+    assert c.get("/models/probe?id=aug/gpt5").status_code == 400
+
+
+def test_allowed_providers_unset_means_no_restriction(fresh_app, monkeypatch):
+    from omniswarm import catalog, registry
+    monkeypatch.delenv("OMNISWARM_ALLOWED_PROVIDERS", raising=False)
+
+    async def fake(app):
+        return [_cm("aug/gpt5")]
+    monkeypatch.setattr(catalog, "get_cached_catalog", fake)
+    c = fresh_app()
+    assert c.post("/settings", json={"models": {"code": "aug/gpt5"}}).status_code == 200
+    assert registry.get_task_type("code").model == "aug/gpt5"
+
+
+def test_post_settings_clears_home_for_slot(fresh_app, monkeypatch):
+    import json as _json
+    from pathlib import Path
+
+    from omniswarm import catalog, runtime
+    monkeypatch.delenv("OMNISWARM_ALLOWED_PROVIDERS", raising=False)
+
+    async def fake(app):
+        return [_cm("a/home"), _cm("b/now"), _cm("c/x")]
+    monkeypatch.setattr(catalog, "get_cached_catalog", fake)
+    c = fresh_app()
+    role = c.get("/settings").json()["council"][0]
+    rt = dict(c.app.state.runtime)
+    rt["failover_home"] = {"code": "a/home", "judge": "a/home", "synth": "a/home",
+                           f"member:{role}": "a/home"}
+    c.app.state.runtime = rt
+    r = c.post("/settings", json={"models": {"code": "a/home"}, "judge": "c/x",
+                                  "members": [{"role": role, "model": "c/x"}]})
+    assert r.status_code == 200
+    assert c.app.state.runtime["failover_home"] == {"synth": "a/home"}   # untouched slot kept
+    saved = _json.loads(Path(runtime._discover(None)).read_text())
+    assert saved["failover_home"] == {"synth": "a/home"}
+    assert c.get("/settings").json()["failover_home"] == {"synth": "a/home"}
+
+
+def test_stats_degraded_reports_reasons(fresh_app, monkeypatch):
+    from omniswarm import catalog, failover, registry
+    monkeypatch.setenv("OMNISWARM_ALLOWED_PROVIDERS", "mistral,nvidia,groq,cerebras")
+    c = fresh_app()
+    s = c.get("/stats").json()
+    assert s["degraded"] == [] and s["degraded_count"] == 0       # healthy defaults → nothing
+
+    role = registry.COUNCIL_MEMBERS[0]["role"]
+    rt = {**c.app.state.runtime, "models": {"code": "groq/now"}, "judge": "mistral/gone",
+          "synth": "cerebras/x", "members": [{"role": role, "model": "aug/gpt5"}],
+          "failover_home": {"code": "mistral/devstral-latest"}}
+    c.app.state.runtime = rt
+    registry.apply_runtime(rt)
+    pins = dict(failover.current_pins())
+
+    async def fake(app):
+        return [_cm(m) for m in pins.values() if m != "mistral/gone"]
+    monkeypatch.setattr(catalog, "get_cached_catalog", fake)
+    c.app.state.provider_breaker.record("cerebras/x", ok=False, status="HTTP 403 EXHAUSTED")
+    s = c.get("/stats").json()
+    by_slot = {d["slot"]: d for d in s["degraded"]}
+    assert set(by_slot) == {"code", "judge", "synth", f"member:{role}"}
+    assert s["degraded_count"] == 4
+    assert by_slot["code"]["model"] == "groq/now" and "home" in by_slot["code"]["reason"]
+    assert "catalog" in by_slot["judge"]["reason"]
+    assert "exhausted" in by_slot["synth"]["reason"]
+    assert "not allowed" in by_slot[f"member:{role}"]["reason"]
+
+
+def test_models_probe_endpoint_counts_empty_200_as_reachable(fresh_app, monkeypatch):
+    import httpx
+
+    from omniswarm import catalog
+
+    async def fake(app):
+        return [_cm("nvidia/some/reasoning-model")]
+    monkeypatch.setattr(catalog, "get_cached_catalog", fake)
+    c = fresh_app()
+    sent = []
+
+    def gateway(request):
+        sent.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": ""},
+                                                      "finish_reason": "length"}]})
+    c.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(gateway))
+    body = c.get("/models/probe?id=nvidia/some/reasoning-model").json()
+    assert body["ok"] is True and body["err"] == ""
+    assert len(sent) == 1

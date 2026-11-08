@@ -186,8 +186,10 @@ Copy `omniswarm.toml.example` to `omniswarm.toml` (or set `OMNISWARM_CONFIG=/pat
 | `OMNISWARM_MAX_CONCURRENT_JOBS` | Concurrency cap |
 | `OMNISWARM_SCHED_INTERVAL` | Scheduler poll interval (seconds) |
 | `OMNISWARM_FAILOVER_THRESHOLD` | Consecutive failed gateway calls before auto-failover (default `6` ≈ two failed requests; `0` disables) |
-| `OMNISWARM_PROVIDER_BREAKER_THRESHOLD` | Quota/auth (403/410/429…) errors from a provider before its circuit breaker trips and routing skips it (default `4`; `0` disables) |
+| `OMNISWARM_PROVIDER_BREAKER_THRESHOLD` | Quota/auth (401/402/403/429) errors from a provider before its circuit breaker trips and routing skips it; also how many 404/410s bench a single model (default `4`; `0` disables) |
 | `OMNISWARM_PROVIDER_BREAKER_COOLDOWN` | Seconds an exhausted provider stays circuit-broken before it's retried (default `1800`) |
+| `OMNISWARM_PROVIDER_UNAVAILABLE_COOLDOWN` | Seconds a provider that **can't run** in your deployment (missing CLI/browser, unconfigured transport) stays benched (default `43200` = 12h) |
+| `OMNISWARM_ALLOWED_PROVIDERS` | Comma-separated provider prefixes models may come from, e.g. `mistral,gemini,groq,nvidia`. Others are hidden from the catalog, recommender and auto-failover, and rejected by the Model Picker (default empty = no restriction) |
 | `OMNISWARM_CACHE` | Verified-answer cache on/off (default `1`) |
 | `OMNISWARM_CACHE_TTL` | Seconds a cached answer stays fresh (default `604800` = 7 days; `0` = never expire) |
 | `OMNISWARM_CACHE_MIN_CONFIDENCE` | Minimum confidence to cache an answer: `high`/`medium`/`low` (default `high`) |
@@ -207,14 +209,26 @@ Recommendations blend three signals: capability metadata from the gateway's `/mo
 
 ### Automatic failover
 
-Free-tier providers go down without warning. When any pinned model racks up consecutive gateway failures, OmniSwarm automatically swaps **every slot using it** — task types, judge, council chair, members — to the top-ranked **proven-healthy** alternative (a model with a real success track record — it won't fail over onto a shiny but untested model that turns out to be dead). The swap goes through the same persisted runtime-override path as the Model Picker, so it survives restarts and is visible and undoable in the Control Panel. A dismissible banner appears on the dashboard when it fires. There is no silent auto-restore: you switch back via the picker (or let a fresh benchmark make the case).
+Free-tier providers go down without warning. When any pinned model racks up consecutive gateway failures, OmniSwarm automatically swaps **every slot using it** — task types, judge, council chair, members — to a healthy alternative. The swap goes through the same persisted runtime-override path as the Model Picker, so it survives restarts and is visible and undoable in the Control Panel. A dismissible banner appears on the dashboard when it fires.
+
+How a replacement is chosen:
+
+- **Proven first.** The top-ranked **proven-healthy** model (a real success track record) wins. It won't fail over onto a shiny but untested model that turns out to be dead.
+- **Unproven only after a probe.** With nothing proven left, untested candidates are tried in rank order, but only swapped in once a tiny real call (about 5 tokens, no retries) answers. At most 3 are probed per slot; if none answers, nothing is swapped and a "no healthy replacement" event is logged. Models that have only ever failed go last.
+- **Spread out.** Each slot gets its own replacement, preferring a provider different from the failing model's and from the other picks, so one quota burst can't take every slot down again. Models are reused only when the candidates run out.
+- **Never blocks you.** Probes run without holding the settings lock, and only slots still pinned to the failing model are swapped, so a change you save mid-failover is never undone.
+
+Each moved slot remembers its original **home** model (kept across chained failovers, cleared when you set that slot yourself). `GET /stats` reports `degraded` (a list of `{slot, model, reason}`) and `degraded_count` for slots that are off their home model, pinned to a model the gateway no longer lists, on an exhausted provider, or on a provider outside `OMNISWARM_ALLOWED_PROVIDERS`. `degraded_count == 0` makes a simple uptime-monitor check. There is no silent auto-restore: you switch back via the picker (or let a fresh benchmark make the case).
+
+**Allowlist.** Gateways can list providers that can't run in your setup at all (for example ones that need a local CLI or a headless browser). Set `OMNISWARM_ALLOWED_PROVIDERS=mistral,gemini,groq` and only those providers' models are offered anywhere; a provider the gateway adds later needs an explicit opt-in.
 
 ### Provider circuit breaker (free-tier resilience)
 
 Free tiers run out. When you're offloading real volume across pooled providers, one will hit its quota or rate limit — and without guardrails a system will happily keep hammering a dead provider, retrying errors that can never succeed, and failing silently. OmniSwarm handles this the way a resilient system should:
 
-- **Fail fast.** Quota/auth/gone errors (`403/410/404/429`) are *not* retried — retrying can't help, it just wastes time and load. Only genuinely transient errors (`5xx`, timeouts) retry.
-- **Trip a breaker for the whole provider.** When a provider returns exhaustion errors, OmniSwarm stops routing to *all* of its models at once — instead of rediscovering each one dead, model by model.
+- **Fail fast.** Quota/auth/gone errors (`403/410/404/429`) are *not* retried — retrying can't help, it just wastes time and load. Neither are errors saying the provider **can't run at all** (e.g. "CLI not found", "not installed", "needs Playwright", "not configured", "must be an absolute path"), even when they arrive as a `502/503`. Only genuinely transient errors (`5xx`, timeouts) retry.
+- **Trip a breaker for the whole provider.** When a provider returns exhaustion errors, OmniSwarm stops routing to *all* of its models at once — instead of rediscovering each one dead, model by model. A can't-run response trips it on first sight and benches the provider for 12 hours (`OMNISWARM_PROVIDER_UNAVAILABLE_COOLDOWN`), long but not forever, so a misread clears itself.
+- **Gone models stay local.** A `404/410` without an explicit exhaustion signal counts against that one model, so a retired model doesn't bench a provider that still serves the rest.
 - **React on the *explicit* signal.** The gateway doesn't just return a status code — it returns a structured reason (e.g. `{"error":{"message":"No active credentials for provider: X"}}` or `rate_limit_exceeded`). OmniSwarm reads that, so a single definitive "out of credits" response trips the breaker **immediately**; ambiguous bare status codes still accrue to a threshold first.
 - **Recover automatically.** A tripped provider is retried after a cooldown, and any successful call clears it — so when the free tier resets, routing flows back on its own.
 - **Show it.** Exhausted providers surface in `GET /stats` (`exhausted_providers`) and as a banner on the dashboard — you *see* the problem instead of learning it from a provider email.
@@ -364,7 +378,8 @@ Each line is processed through the council. Full results — vetted text, verdic
 
 ```
 GET /reliability    → per-model success%, latency, 429 count
-GET /stats          → aggregate offload totals and tokens saved
+GET /stats          → aggregate offload totals and tokens saved, provider breaker state,
+                      degraded slots (degraded, degraded_count)
 ```
 
 Both are surfaced in the live dashboard's model leaderboard section.

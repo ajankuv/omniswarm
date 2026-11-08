@@ -11,6 +11,8 @@ services:
       - OMNISWARM_OMNIROUTE_URL=http://localhost:20128/v1
       # Optional: protect the instance + tune (also editable live in the Control Panel)
       # - OMNISWARM_API_TOKEN=
+      # Optional: only use these gateway providers (empty = all)
+      # - OMNISWARM_ALLOWED_PROVIDERS=mistral,gemini,groq
       # Optional: bring your own model map / council roster
       # - OMNISWARM_CONFIG=/config/omniswarm.toml
     volumes:
